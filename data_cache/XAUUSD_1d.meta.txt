@@ -1,0 +1,1 @@
+source=yfinance symbol=GC=F fetched_at=2026-11-04T14:07:59.802974+00:00 rows=504 period=2y interval=1d

@@ -1,0 +1,9 @@
+venv312/
+__pycache__/
+*.pyc
+.env
+*.db
+.pytest_cache/
+# Managed as its own separate git clone, not nested inside this repo's history
+# (see PROGRESS.md for the exact clone command to reproduce it).
+vendor_tradingagents/
