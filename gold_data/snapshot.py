@@ -32,12 +32,12 @@ import numpy as np
 import pandas as pd
 
 from .mt4_csv import ImportedSeries
-from .quality import QualityReport, run_quality_checks
+from .quality import QualityReport, compute_recency, run_quality_checks
 from .symbols import InstrumentKind
 from .timeframe import MINUTES, STANDARD_SNAPSHOT_TIMEFRAMES, Timeframe
 from .timeutil import comparison_index, coerce_reference
 
-SCHEMA_VERSION = "gold_snapshot/2"
+SCHEMA_VERSION = "gold_snapshot/3"
 _OHLCV = ["open", "high", "low", "close", "volume"]
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_]+\.csv$")
 
@@ -474,6 +474,10 @@ def load_snapshot(directory: str | Path) -> MarketSnapshot:
     # cross-check tz_known vs timezone (review item 6): they must agree
     if meta["tz_known"] != (tz != "UNKNOWN"):
         raise IntegrityError(f"tz_known={meta['tz_known']} disagrees with timezone={tz!r}")
+    data_tz = None if tz == "UNKNOWN" else tz
+    tz_known = meta["tz_known"]
+    ref_closed = coerce_reference(meta["analysis_reference_time"], data_tz, tz_known) \
+        if meta["analysis_reference_time"] else None
 
     tfmap: dict[str, TimeframeData] = {}
     for tf, m in meta["timeframes"].items():
@@ -503,7 +507,7 @@ def load_snapshot(directory: str | Path) -> MarketSnapshot:
             raise IntegrityError(f"{tf} first bar {derived_first} != stored {m['first_bar']}")
         if (m["last_bar"] or None) != derived_last:
             raise IntegrityError(f"{tf} last bar {derived_last} != stored {m['last_bar']}")
-        # per-timeframe source must match the snapshot's instrument
+        # per-timeframe source must match the snapshot's instrument AND source id
         src = m.get("source", {})
         if src.get("symbol_canonical") not in (None, meta["symbol_canonical"]):
             raise IntegrityError(f"{tf} source symbol {src.get('symbol_canonical')} != "
@@ -511,11 +515,32 @@ def load_snapshot(directory: str | Path) -> MarketSnapshot:
         if src.get("instrument_kind") not in (None, meta["instrument_kind"]):
             raise IntegrityError(f"{tf} source kind {src.get('instrument_kind')} != "
                                  f"snapshot kind {meta['instrument_kind']}")
+        snap_sources = meta.get("source_ids", ["unknown"])
+        if src.get("source_id") is not None and src.get("source_id") not in snap_sources:
+            raise IntegrityError(f"{tf} source_id {src.get('source_id')!r} not in snapshot "
+                                 f"source_ids {snap_sources}")
+        # RECOMPUTE closed-bar status and recency from the actual content + the
+        # stored reference/timezone — never trust the stored metadata values on
+        # their own (review round-3 item 2).
+        last_open = frame.index[-1] if len(frame) else None
+        last_cmp = comparison_index(frame.index[[-1]], data_tz, tz_known)[0] if len(frame) else None
+        closed = _closed_status(last_cmp, Timeframe(tf), ref_closed, tz_known)
+        if last_open is not None:
+            closed["last_bar_open"] = str(last_open)
+        stored_stale = m["quality"].get("staleness", {}) if isinstance(m.get("quality"), dict) else {}
+        tol_min = stored_stale.get("tolerance_minutes")
+        recency_ref = coerce_reference(stored_stale.get("reference_time"), data_tz, tz_known) \
+            if stored_stale.get("reference_time") else None
+        recency = compute_recency(
+            last_open, Timeframe(tf), recency_ref, tz_known, data_tz,
+            _dt.timedelta(minutes=tol_min) if tol_min is not None else None)
+        quality = dict(m["quality"])
+        quality["staleness"] = recency
         tfmap[tf] = TimeframeData(
             timeframe=m["timeframe"], timeframe_consistent=m["timeframe_consistent"],
-            timeframe_source=m["timeframe_source"], source=m["source"], quality=m["quality"],
+            timeframe_source=m["timeframe_source"], source=m["source"], quality=quality,
             first_bar=m["first_bar"], last_bar=m["last_bar"], bar_count=m["bar_count"],
-            closed_last_bar=m["closed_last_bar"], content_sha256=m["content_sha256"],
+            closed_last_bar=closed, content_sha256=m["content_sha256"],
             forming_bar=m.get("forming_bar"), frame=frame, extras=extras)
 
     snap = MarketSnapshot(

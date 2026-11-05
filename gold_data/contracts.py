@@ -307,15 +307,41 @@ class TradePlan:
         return self.status in _ACTIONABLE
 
     @property
-    def is_usable(self) -> bool:
-        """True iff the plan is in an actionable status AND re-validates now."""
-        if self.status not in _ACTIONABLE:
-            return False
+    def is_structurally_valid(self) -> bool:
+        """True iff the plan's current structure/values re-validate (any status)."""
         try:
             self.validate()
             return True
         except ValueError:
             return False
+
+    @property
+    def is_usable(self) -> bool:
+        """True iff the plan is in an actionable status AND re-validates now.
+
+        This checks STRUCTURE only. Time-bound usability (not expired at a given
+        moment) is a separate decision — see ``usable_at``.
+        """
+        return self.status in _ACTIONABLE and self.is_structurally_valid
+
+    def usable_at(self, reference_time: Any) -> bool:
+        """True iff usable AND not expired at ``reference_time`` (explicit clock).
+
+        Separates structural validity from time-bound usage: a structurally
+        valid, actionable plan is still not usable once its expiry has passed.
+        ``reference_time`` must be given explicitly (no hidden 'now').
+        """
+        if not self.is_usable:
+            return False
+        if self.expiry is None:
+            return True
+        ref = _dt.datetime.fromisoformat(str(reference_time))
+        exp = _dt.datetime.fromisoformat(self.expiry)
+        # compare on matching awareness; if one is naive treat both as naive wall-clock
+        if (ref.tzinfo is None) != (exp.tzinfo is None):
+            ref = ref.replace(tzinfo=None)
+            exp = exp.replace(tzinfo=None)
+        return ref < exp
 
     def _revalidate_nested(self) -> None:
         """Re-run each nested price object's OWN invariants against its CURRENT

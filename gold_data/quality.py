@@ -76,6 +76,33 @@ class QualityReport:
                 if k not in ("accepted_frame", "accepted_extras")}
 
 
+def compute_recency(last_open, tf: Timeframe, ref, tz_known: bool, data_tz,
+                    stale_tolerance: Optional[_dt.timedelta]) -> dict[str, Any]:
+    """Recency of the last CLOSED bar vs ``ref`` (a coerced comparison-clock ts).
+
+    Measured from the bar's CLOSE time. ``is_stale`` uses ``age > tolerance`` so
+    a zero tolerance is honoured at the boundary (age == 0 is fresh). A zero
+    ``timedelta`` is treated as supplied (checked with ``is not None``, never
+    truthiness), so zero slack never silently disappears.
+    """
+    base: dict[str, Any] = {"status": "unknown", "measured_from": "bar_close", "unit": "minutes"}
+    if ref is None or last_open is None or pd.isna(last_open):
+        return base
+    last_cmp = comparison_index(pd.DatetimeIndex([last_open]), data_tz, tz_known)[0]
+    last_close = last_cmp + pd.Timedelta(minutes=MINUTES[tf])
+    age_min = (ref - last_close).total_seconds() / 60.0
+    tol_min = stale_tolerance.total_seconds() / 60.0 if stale_tolerance is not None else None
+    base.update({
+        "status": "evaluated" if tz_known else "provisional",
+        "reference_time": str(ref), "last_closed_bar_open": str(last_open),
+        "last_closed_bar_close": str(last_close), "age_minutes": round(age_min, 2),
+        "tolerance_minutes": tol_min,
+        "is_stale": (age_min > tol_min) if tol_min is not None else None,
+        "tz_known": tz_known,
+    })
+    return base
+
+
 def run_quality_checks(
     imported: ImportedSeries,
     reference_time: Any = None,
@@ -274,27 +301,16 @@ def run_quality_checks(
                 "session break without a configured session calendar) — review for missing "
                 f"data; possible missing bars in the largest listed: {missing_total}")
 
-    # staleness: measured from the last CLOSED bar's CLOSE time
-    staleness: dict[str, Any] = {"status": "unknown", "measured_from": "bar_close", "unit": "minutes"}
+    # staleness: measured from the last CLOSED bar's CLOSE time (content-derived)
     last_bar = str(surviving.index[-1]) if len(surviving) else None
     first_bar = str(surviving.index[0]) if len(surviving) else None
-    if ref is not None and len(surviving):
-        last_cmp = comparison_index(surviving.index[[-1]], data_tz, tz_known)[0]
-        last_close = last_cmp + tf_delta
-        age_min = (ref - last_close).total_seconds() / 60.0
-        tol_min = stale_tolerance.total_seconds() / 60.0 if stale_tolerance else None
-        staleness.update({
-            "status": "evaluated" if tz_known else "provisional",
-            "reference_time": str(ref), "last_closed_bar_open": str(surviving.index[-1]),
-            "last_closed_bar_close": str(last_close), "age_minutes": round(age_min, 2),
-            "tolerance_minutes": tol_min,
-            "is_stale": (age_min > tol_min) if tol_min is not None else None,
-            "tz_known": tz_known,
-        })
-        if tol_min is not None and age_min > tol_min:
-            warnings.append(f"data is STALE: last closed bar closes {last_close} is "
-                            f"{age_min:.0f} min before reference {ref} (tolerance {tol_min:.0f} min)"
-                            + ("" if tz_known else " [PROVISIONAL: timezone unknown]"))
+    last_open = surviving.index[-1] if len(surviving) else None
+    staleness = compute_recency(last_open, tf, ref, tz_known, data_tz, stale_tolerance)
+    if staleness.get("is_stale") is True:
+        warnings.append(f"data is STALE: last closed bar closes {staleness['last_closed_bar_close']} "
+                        f"is {staleness['age_minutes']:.0f} min before reference {ref} "
+                        f"(tolerance {staleness['tolerance_minutes']:.0f} min)"
+                        + ("" if tz_known else " [PROVISIONAL: timezone unknown]"))
 
     surviving.index.name = "time"
     return QualityReport(
