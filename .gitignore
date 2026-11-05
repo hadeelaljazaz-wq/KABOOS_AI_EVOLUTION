@@ -7,3 +7,14 @@ __pycache__/
 # Managed as its own separate git clone, not nested inside this repo's history
 # (see PROGRESS.md for the exact clone command to reproduce it).
 vendor_tradingagents/
+
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.pyc
+*.pem
+*.key

@@ -1,3 +1,3 @@
-from .store import CollectiveMemory, KnowledgeItem
+from .store import CollectiveMemory, KnowledgeItem, validate_evidence
 
-__all__ = ["CollectiveMemory", "KnowledgeItem"]
+__all__ = ["CollectiveMemory", "KnowledgeItem", "validate_evidence"]

@@ -3,9 +3,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import threading
+
 import pytest
 
-from collective_memory import CollectiveMemory
+from collective_memory import CollectiveMemory, validate_evidence
 
 
 @pytest.fixture()
@@ -62,3 +64,127 @@ def test_persists_across_reopen(tmp_path):
     m2.close()
     assert len(rows) == 1
     assert "holiday" in rows[0]["content"]
+
+
+# --- regressions for the five reported bugs ---------------------------
+
+
+def test_bug1_evidence_must_be_well_formed(mem):
+    hid = mem.propose_hypothesis("xauusd", "stmt", "agent_a")
+    # a non-empty but hand-wavy dict with no backing key is rejected
+    with pytest.raises(ValueError):
+        mem.confirm_hypothesis(hid, evidence={"note": "looks good to me"}, validated_by="agent_b")
+    # a backing key present but empty is rejected
+    with pytest.raises(ValueError):
+        mem.confirm_hypothesis(hid, evidence={"backtest_id": ""}, validated_by="agent_b")
+    # implausible statistics are rejected
+    with pytest.raises(ValueError):
+        mem.confirm_hypothesis(hid, evidence={"p_value": 1.5}, validated_by="agent_b")
+    with pytest.raises(ValueError):
+        mem.confirm_hypothesis(hid, evidence={"sample_size": 1}, validated_by="agent_b")
+    # still a pending hypothesis after all those rejections
+    assert mem.query_knowledge(topic="xauusd")[0].status == "hypothesis"
+
+
+def test_bug1_validate_evidence_standalone():
+    with pytest.raises(ValueError):
+        validate_evidence({})
+    with pytest.raises(ValueError):
+        validate_evidence("not a dict")
+    validate_evidence({"backtest_id": "bt_1", "sample_size": 20, "p_value": 0.02})  # ok
+
+
+def test_bug2_foreign_keys_enforced(mem):
+    # foreign_keys pragma must be ON, so a dangling discussion_id can't be inserted
+    val = mem._conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    assert val == 1
+
+
+def test_bug3_post_message_rejects_missing_discussion(mem):
+    with pytest.raises(ValueError):
+        mem.post_message(999999, "agent_a", "claim", "to a non-existent discussion")
+
+
+def test_bug3_post_message_rejects_bad_type(mem):
+    did = mem.start_discussion("topic", "agent_a")
+    with pytest.raises(ValueError):
+        mem.post_message(did, "agent_a", "rant", "not a valid message type")
+
+
+def test_bug4_cannot_reject_a_confirmed_hypothesis(mem):
+    hid = mem.propose_hypothesis("xauusd", "stmt", "agent_a")
+    mem.confirm_hypothesis(hid, evidence={"backtest_id": "bt_9", "sample_size": 30}, validated_by="agent_b")
+    with pytest.raises(ValueError):
+        mem.reject_hypothesis(hid, reason="changed my mind", validated_by="agent_c")
+    with pytest.raises(ValueError):
+        mem.confirm_hypothesis(hid, evidence={"backtest_id": "bt_10"}, validated_by="agent_c")
+    assert mem.query_knowledge(topic="xauusd")[0].status == "confirmed"
+
+
+def test_bug4_reject_requires_reason(mem):
+    hid = mem.propose_hypothesis("t", "s", "a")
+    with pytest.raises(ValueError):
+        mem.reject_hypothesis(hid, reason="   ", validated_by="b")
+
+
+def test_bug5_concurrent_writes_do_not_lose_rows(tmp_path):
+    db = tmp_path / "concurrent.db"
+    mem = CollectiveMemory(db)
+    n_threads, per_thread = 8, 50
+
+    def worker(tid):
+        for i in range(per_thread):
+            mem.remember(f"agent_{tid}", "note", f"row {i}")
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    total = sum(len(mem.recall(f"agent_{t}", limit=1000)) for t in range(n_threads))
+    mem.close()
+    assert total == n_threads * per_thread  # no lost/corrupted writes under contention
+
+
+def test_bug5_concurrent_confirm_has_single_winner(tmp_path):
+    # Many threads race to confirm the same hypothesis; exactly one may win,
+    # the rest must raise (no double-transition, no corruption).
+    db = tmp_path / "race.db"
+    mem = CollectiveMemory(db)
+    hid = mem.propose_hypothesis("t", "s", "a")
+    wins, losses = [], []
+
+    def racer():
+        try:
+            mem.confirm_hypothesis(hid, evidence={"backtest_id": "bt", "sample_size": 10}, validated_by="x")
+            wins.append(1)
+        except ValueError:
+            losses.append(1)
+
+    threads = [threading.Thread(target=racer) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    mem.close()
+    assert len(wins) == 1
+    assert len(losses) == 9
+
+
+def test_discussion_resumable_after_restart(tmp_path):
+    db = tmp_path / "resume.db"
+    m1 = CollectiveMemory(db)
+    did = m1.start_discussion("Gold direction into Fed", "agent_a", goal="agree a bias with evidence")
+    m1.post_message(did, "agent_a", "claim", "bullish on softening real yields")
+    m1.close()
+
+    m2 = CollectiveMemory(db)
+    still_open = m2.open_discussions()
+    assert any(d["id"] == did for d in still_open)
+    m2.post_message(did, "agent_b", "objection", "DXY firmed overnight")
+    msgs = m2.get_discussion(did)
+    assert [x["message_type"] for x in msgs] == ["claim", "objection"]
+    m2.close_discussion(did)
+    assert all(d["id"] != did for d in m2.open_discussions())
+    m2.close()

@@ -13,7 +13,7 @@ from discovery_lab import (
     sma_crossover_signal,
     buy_and_hold_signal,
     walk_forward_split,
-    permutation_pvalue,
+    signal_permutation_pvalue,
 )
 
 
@@ -84,9 +84,63 @@ def test_walk_forward_rejects_too_few_rows():
         walk_forward_split(3, n_splits=4)
 
 
-def test_permutation_pvalue_is_a_probability(gold):
+def test_signal_permutation_pvalue_is_a_probability(gold):
     close = gold["Close"]
     signal = sma_crossover_signal(close, fast=10, slow=30)
-    result = run_backtest(close, signal, TransactionCosts())
-    p = permutation_pvalue(result.net_returns, n_sims=200)
-    assert 0.0 <= p <= 1.0
+    market_returns = close.pct_change().fillna(0.0)
+    p = signal_permutation_pvalue(signal, market_returns, n_sims=200)
+    assert 0.0 < p <= 1.0
+
+
+def test_permutation_is_non_degenerate():
+    # Regression for the statistical bug: the old test shuffled the
+    # strategy's own returns, whose Sharpe is permutation-invariant, so the
+    # shuffled Sharpe distribution had (essentially) zero spread. The fixed
+    # test shuffles market returns against a fixed position, which MUST give
+    # a non-degenerate distribution of shuffled Sharpes.
+    import numpy as np
+    import pandas as pd
+
+    from discovery_lab.validation import _sharpe
+
+    rng = np.random.default_rng(0)
+    n = 300
+    idx = pd.RangeIndex(n)
+    position = pd.Series(rng.choice([-1, 0, 1], size=n), index=idx)
+    market = pd.Series(rng.normal(0, 0.01, size=n), index=idx)
+
+    mkt = market.to_numpy()
+    pos = position.to_numpy(dtype=float)
+    shuffled_sharpes = []
+    for _ in range(200):
+        shuffled_sharpes.append(_sharpe(pos * rng.permutation(mkt)))
+    assert np.std(shuffled_sharpes) > 1e-3  # genuinely spread out, not a point mass
+
+
+def test_permutation_detects_a_real_edge():
+    # A position that is deliberately aligned with next-day returns (a
+    # look-ahead "cheat") must score a LOW p-value; a random position must
+    # not. This proves the test actually discriminates signal from noise.
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(1)
+    n = 400
+    idx = pd.RangeIndex(n)
+    market = pd.Series(rng.normal(0, 0.01, size=n), index=idx)
+    # Cheating position: sign of the SAME bar's return (perfect alignment).
+    cheat_pos = pd.Series(np.sign(market.to_numpy()), index=idx)
+    random_pos = pd.Series(rng.choice([-1, 1], size=n), index=idx)
+
+    p_cheat = signal_permutation_pvalue(cheat_pos, market, n_sims=300)
+    p_random = signal_permutation_pvalue(random_pos, market, n_sims=300)
+    assert p_cheat < 0.05
+    assert p_random > p_cheat
+
+
+def test_market_source_is_honest_about_futures(gold):
+    from discovery_lab.data import market_source
+
+    note = market_source("XAUUSD")
+    assert "futures" in note.lower()
+    assert "not spot" in note.lower() or "proxy" in note.lower()
