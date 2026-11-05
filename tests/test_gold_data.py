@@ -203,9 +203,16 @@ def test_staleness_vs_reference_time(tmp_path):
     # last bar is 2026-01-05 09:00; reference a week later -> stale
     ref = dt.datetime(2026, 1, 12, 0, 0)
     rep = run_quality_checks(s, reference_time=ref, stale_tolerance=dt.timedelta(hours=2))
-    assert rep.staleness["status"] == "evaluated"
+    # tz is UNKNOWN here, so staleness is provisional (not a confirmed evaluation)
+    assert rep.staleness["status"] == "provisional"
     assert rep.staleness["is_stale"] is True
-    # a reference right after the last bar -> fresh
+    # with the timezone known it becomes a confirmed evaluation
+    s_tz = read_mt4_csv(_write(tmp_path / "XAUUSD.smlH1tz.csv", _hourly_rows(n=10)),
+                        timezone="Etc/UTC")
+    rep_tz = run_quality_checks(s_tz, reference_time=ref, stale_tolerance=dt.timedelta(hours=2))
+    assert rep_tz.staleness["status"] == "evaluated"
+    assert rep_tz.staleness["is_stale"] is True
+    # a reference right after the last closed bar -> fresh
     rep2 = run_quality_checks(s, reference_time=dt.datetime(2026, 1, 5, 9, 30),
                               stale_tolerance=dt.timedelta(hours=2))
     assert rep2.staleness["is_stale"] is False
@@ -274,19 +281,24 @@ def test_snapshot_save_load_preserves_identity(tmp_path):
     out = snap.save(tmp_path / "snap")
     loaded = load_snapshot(out)
     assert loaded.snapshot_id == snap.snapshot_id
-    assert loaded.fingerprint() == snap.snapshot_id          # reproducible
+    assert loaded.compute_id() == snap.snapshot_id           # reproducible
     assert loaded.symbol_originals == snap.symbol_originals
     assert loaded.timeframes["H1"].bar_count == snap.timeframes["H1"].bar_count
     assert loaded.timeframes["H1"].source["file_sha256"] == snap.timeframes["H1"].source["file_sha256"]
 
 
-def test_snapshot_closed_status_depends_on_reference(tmp_path):
+def test_snapshot_excludes_forming_bar_no_future_leak(tmp_path):
+    # bars 00:00..09:00 (open times). At ref 09:30 the 09:00 H1 bar is still
+    # forming (closes 10:00) and MUST NOT appear in the analysis-safe set, so
+    # its final OHLC can't leak. The last closed bar is then 08:00.
     h1 = _import(tmp_path, _hourly_rows(n=10, start="2026.01.05 00:00"), name="XAUUSD.smlH1.csv")
-    # ref before the last bar closes -> not closed
     snap_open = MarketSnapshot.build([h1], analysis_reference_time=dt.datetime(2026, 1, 5, 9, 30))
-    assert snap_open.timeframes["H1"].closed_last_bar["is_closed"] is False
-    snap_closed = MarketSnapshot.build([h1], analysis_reference_time=dt.datetime(2026, 1, 5, 12, 0))
-    assert snap_closed.timeframes["H1"].closed_last_bar["is_closed"] is True
+    d = snap_open.timeframes["H1"]
+    assert str(d.frame.index[-1]) == "2026-01-05 08:00:00"      # 09:00 excluded
+    assert d.forming_bar is not None and d.forming_bar["open_time"] == "2026-01-05 09:00:00"
+    # once 09:00 has closed (ref 10:00) it becomes available
+    snap_closed = MarketSnapshot.build([h1], analysis_reference_time=dt.datetime(2026, 1, 5, 10, 0))
+    assert str(snap_closed.timeframes["H1"].frame.index[-1]) == "2026-01-05 09:00:00"
 
 
 # --- contracts -------------------------------------------------------------

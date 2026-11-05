@@ -1,44 +1,43 @@
-"""Quality checks for imported OHLCV candles (spec section 2, "فحوص الجودة").
+"""Quality checks for imported OHLCV candles (spec section 2 + review items).
 
 The checker NEVER silently repairs values or drops rows. It returns a
-:class:`QualityReport` that enumerates, with reasons:
+:class:`QualityReport` that enumerates, with reasons and SOURCE ROW NUMBERS:
 
-  - rows rejected (bad timestamp, non-finite / non-positive price, OHLC
-    inconsistency, negative volume, conflicting duplicate, or a bar later than
-    the analysis reference time);
-  - identical duplicates collapsed (same timestamp AND same values);
-  - whether the input was out of chronological order (it is sorted for the
-    cleaned output, and that reordering is reported — not hidden);
-  - time gaps, with weekend/market-closed gaps classified separately so a
-    closed market is not treated as an error;
-  - staleness vs. an EXPLICIT reference time and a configurable tolerance.
+  - rows rejected (bad timestamp, non-finite/missing or non-positive price,
+    OHLC inconsistency, negative volume, conflicting duplicate, or a bar whose
+    OPEN is after the reference time);
+  - the forming/incomplete last bar at the reference time, set ASIDE from the
+    analysis-safe set (its final OHLC is not known until it closes) — this is
+    the look-ahead guard (review item 2);
+  - identical duplicates collapsed (same timestamp AND same OHLCV AND same
+    extras) vs. conflicting duplicates (same timestamp, any difference incl.
+    extras) which are rejected;
+  - out-of-order input (sorted for output, and reported, not hidden);
+  - time gaps, classified conservatively (weekend/closed vs. UNRESOLVED) with
+    the number of possibly-missing bars always visible — no gap is declared a
+    "session break" from its duration alone (review item 5);
+  - staleness measured from the last CLOSED bar's CLOSE time vs. an EXPLICIT
+    reference, flagged provisional when the timezone is unknown (items 1, 2).
 
-The cleaned, analysis-ready frame is returned on ``report.accepted_frame``; it
-contains exactly the accepted rows and nothing was changed in them.
+``accepted_frame`` holds exactly the analysis-safe (closed) rows, unmodified;
+``accepted_extras`` holds the preserved extra_* columns for the same rows.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from .mt4_csv import ImportedSeries
 from .timeframe import MINUTES, Timeframe
+from .timeutil import comparison_index, coerce_reference
 
-_MAX_SAMPLES = 50  # cap on per-reason example rows kept in the report
-
-
-def _coerce_ref_time(ref: Any) -> Optional[pd.Timestamp]:
-    if ref is None:
-        return None
-    ts = pd.Timestamp(ref)
-    if ts.tzinfo is not None:
-        ts = ts.tz_localize(None)  # compare in the same naive clock as MT4 bars
-    return ts
+_MAX_SAMPLES = 50
+_UNSET = object()
 
 
 @dataclass
@@ -54,13 +53,15 @@ class QualityReport:
     conflicting_duplicate_groups: int = 0
     was_out_of_order: bool = False
     gap_count: int = 0
-    unexpected_gap_count: int = 0
+    unresolved_gap_count: int = 0
     largest_gaps: list[dict[str, Any]] = field(default_factory=list)
     staleness: dict[str, Any] = field(default_factory=dict)
+    forming_bar: Optional[dict[str, Any]] = None
+    forming_excluded_count: int = 0
     first_bar: Optional[str] = None
     last_bar: Optional[str] = None
-    # the cleaned, accepted-only frame (nothing modified in the surviving rows)
     accepted_frame: pd.DataFrame = field(default_factory=pd.DataFrame, repr=False)
+    accepted_extras: pd.DataFrame = field(default_factory=pd.DataFrame, repr=False)
 
     @property
     def rejected_total(self) -> int:
@@ -71,230 +72,249 @@ class QualityReport:
         return self.accepted_rows == 0
 
     def summary(self) -> dict[str, Any]:
-        d = {k: v for k, v in self.__dict__.items() if k != "accepted_frame"}
-        return d
-
-
-def _record_reject(counts, samples, mask, frame, reason):
-    n = int(mask.sum())
-    if n == 0:
-        return
-    counts[reason] = counts.get(reason, 0) + n
-    for ts in frame.index[mask][:_MAX_SAMPLES]:
-        if len(samples) < _MAX_SAMPLES * 4:
-            samples.append({"time": str(ts), "reason": reason})
+        return {k: v for k, v in self.__dict__.items()
+                if k not in ("accepted_frame", "accepted_extras")}
 
 
 def run_quality_checks(
     imported: ImportedSeries,
     reference_time: Any = None,
     stale_tolerance: Optional[_dt.timedelta] = None,
-    cutoff_time: Any = None,
+    cutoff_time: Any = _UNSET,
+    session_break_minutes: Optional[set[int]] = None,
 ) -> QualityReport:
     """Validate an :class:`ImportedSeries`; produce a full accept/reject report.
 
-    ``reference_time`` drives the staleness check (and is the default cutoff).
-    ``cutoff_time`` (defaults to ``reference_time``) rejects any bar stamped
-    AFTER it — the look-ahead guard for an analytical snapshot. Timestamps are
-    naive MT4/MT5 clock values; the reference time is compared in that same
-    naive clock, and the assumption is noted when the timezone is unknown.
+    ``reference_time`` drives staleness and (by default) the look-ahead cutoff.
+    A bar is analysis-safe only if it has CLOSED by the reference time
+    (open + timeframe <= reference); the still-forming bar is set aside, and
+    bars opening after the reference are rejected. ``cutoff_time`` overrides the
+    cutoff; pass ``None`` to disable it. Comparisons use UTC when the timezone
+    is known, else the naive broker clock (then flagged provisional).
     """
-    f = imported.frame
-    tf = imported.timeframe.timeframe
-    counts: dict[str, int] = {}
-    samples: list[dict[str, Any]] = []
-    warnings: list[str] = list(imported.notes)
+    data_tz = imported.timezone
+    tz_known = imported.tz_known
+    tf: Timeframe = imported.timeframe.timeframe
+    step = MINUTES[tf]
+    tf_delta = pd.Timedelta(minutes=step)
 
-    ref = _coerce_ref_time(reference_time)
-    cutoff = _coerce_ref_time(cutoff_time) if cutoff_time is not None else ref
-    if (ref is not None or cutoff is not None) and not imported.tz_known:
+    frame = imported.frame
+    extras = imported.extras
+    n = len(frame)
+    src_rows = imported.source_rows or list(range(1, n + 1))
+
+    ref = coerce_reference(reference_time, data_tz, tz_known)
+    cutoff = ref if cutoff_time is _UNSET else coerce_reference(cutoff_time, data_tz, tz_known)
+
+    warnings: list[str] = list(imported.notes)
+    if (ref is not None or cutoff is not None) and not tz_known:
         warnings.append(
-            "reference/cutoff time compared against naive MT4 timestamps while "
-            "timezone is UNKNOWN; staleness and look-ahead results assume the "
-            "same clock and are provisional"
+            "reference/cutoff compared against naive timestamps while timezone is "
+            "UNKNOWN; staleness/closed/look-ahead results are PROVISIONAL, not a "
+            "confirmed temporal verification"
         )
 
-    # Work on a copy with a positional reset so masks align with original order.
-    df = f.copy()
-    o, h, l, c, v = (df["open"], df["high"], df["low"], df["close"], df["volume"])
+    idx = frame.index
+    cmp_idx = comparison_index(idx, data_tz, tz_known)
 
-    bad_time = df.index.isna()
-    # finite check only where price present
-    def _nonfinite(s):
-        return s.apply(lambda x: isinstance(x, float) and (math.isinf(x))) | s.isna()
-    nonfinite = _nonfinite(o) | _nonfinite(h) | _nonfinite(l) | _nonfinite(c)
-    valid_prices = ~(bad_time | nonfinite)
+    o = pd.to_numeric(frame["open"], errors="coerce").to_numpy(dtype="float64")
+    h = pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype="float64")
+    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(dtype="float64")
+    c = pd.to_numeric(frame["close"], errors="coerce").to_numpy(dtype="float64")
+    v = pd.to_numeric(frame["volume"], errors="coerce").to_numpy(dtype="float64")
 
-    nonpos = pd.Series(False, index=df.index)
-    nonpos[valid_prices] = (o[valid_prices] <= 0) | (h[valid_prices] <= 0) | \
-                           (l[valid_prices] <= 0) | (c[valid_prices] <= 0)
+    bad_time = np.asarray(idx.isna())
+    with np.errstate(invalid="ignore"):
+        nonfinite = ~(np.isfinite(o) & np.isfinite(h) & np.isfinite(low) & np.isfinite(c))
+        nonpos = (o <= 0) | (h <= 0) | (low <= 0) | (c <= 0)
+        ohlc_bad = (h < o) | (h < c) | (h < low) | (low > o) | (low > c) | (low > h)
+        neg_vol = v < 0  # NaN -> False
 
-    ohlc_bad = pd.Series(False, index=df.index)
-    chk = valid_prices & ~nonpos
-    hi_ok = h[chk] >= o[chk]
-    hi_ok &= h[chk] >= c[chk]
-    hi_ok &= h[chk] >= l[chk]
-    lo_ok = l[chk] <= o[chk]
-    lo_ok &= l[chk] <= c[chk]
-    lo_ok &= l[chk] <= h[chk]
-    ohlc_bad[chk] = ~(hi_ok & lo_ok)
-
-    neg_vol = pd.Series(False, index=df.index)
-    has_vol = v.notna()
-    neg_vol[has_vol] = v[has_vol] < 0
-
-    after_cutoff = pd.Series(False, index=df.index)
+    # look-ahead split (future rejected, forming set aside)
+    future = np.zeros(n, dtype=bool)
+    forming = np.zeros(n, dtype=bool)
     if cutoff is not None:
         valid_t = ~bad_time
-        after_cutoff[valid_t] = df.index[valid_t] > cutoff
+        open_cmp = cmp_idx
+        gt = np.asarray(open_cmp > cutoff)
+        close_cmp = open_cmp + tf_delta
+        le_open = np.asarray(open_cmp <= cutoff)
+        gt_close = np.asarray(close_cmp > cutoff)
+        future = valid_t & gt
+        forming = valid_t & le_open & gt_close
 
-    # Priority order so each row is rejected for one primary reason.
-    rejected = pd.Series(False, index=df.index)
-    for mask, reason in [
-        (bad_time, "bad_timestamp"),
-        (nonfinite & ~rejected, "nonfinite_or_missing_price"),
-        (nonpos & ~rejected, "nonpositive_price"),
-        (ohlc_bad & ~rejected, "ohlc_inconsistent"),
-        (neg_vol & ~rejected, "negative_volume"),
-        (after_cutoff & ~rejected, "after_reference_time"),
-    ]:
+    rejected = np.zeros(n, dtype=bool)
+    reason = np.array([""] * n, dtype=object)
+
+    def mark(mask: np.ndarray, label: str):
         m = mask & ~rejected
-        _record_reject(counts, samples, m, df, reason)
-        rejected |= m
+        reason[m] = label
+        rejected[m] = True
 
-    surviving = df[~rejected].copy()
+    mark(bad_time, "bad_timestamp")
+    mark(nonfinite, "nonfinite_or_missing_price")
+    mark(nonpos, "nonpositive_price")
+    mark(ohlc_bad, "ohlc_inconsistent")
+    mark(neg_vol, "negative_volume")
+    mark(future, "after_reference_time")
 
-    # Ordering: report (don't hide) that the input wasn't sorted.
+    forming_mask = forming & ~rejected  # set aside, not an error
+    accepted_mask = ~rejected & ~forming_mask
+
+    counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    for label in ("bad_timestamp", "nonfinite_or_missing_price", "nonpositive_price",
+                  "ohlc_inconsistent", "negative_volume", "after_reference_time"):
+        positions = np.nonzero(reason == label)[0]
+        if len(positions):
+            counts[label] = int(len(positions))
+            for pos in positions[:_MAX_SAMPLES]:
+                samples.append({"source_row": int(src_rows[pos]),
+                                "time": str(idx[pos]), "reason": label})
+
+    forming_bar = None
+    forming_excluded = int(forming_mask.sum())
+    if forming_excluded:
+        last_forming = np.nonzero(forming_mask)[0][-1]
+        forming_bar = {
+            "source_row": int(src_rows[last_forming]),
+            "open_time": str(idx[last_forming]),
+            "closes_at": str((cmp_idx[last_forming] + tf_delta)),
+            "note": "forming/incomplete at reference; excluded from analysis-safe set",
+        }
+        warnings.append(f"{forming_excluded} bar(s) still forming at the reference time "
+                        "excluded from the analysis-safe set (kept only descriptively)")
+
+    surviving = frame.iloc[accepted_mask].copy()
+    surv_extras = extras.iloc[accepted_mask].copy() if len(extras.columns) else \
+        pd.DataFrame(index=surviving.index)
+    surv_src = [int(src_rows[i]) for i in np.nonzero(accepted_mask)[0]]
+
     was_out_of_order = not surviving.index.is_monotonic_increasing
     if was_out_of_order:
         warnings.append("input rows were not in chronological order; sorted for the cleaned output")
-    surviving = surviving.sort_index(kind="stable")
+    order = np.argsort(surviving.index.values, kind="stable")
+    surviving = surviving.iloc[order]
+    surv_extras = surv_extras.iloc[order]
+    surv_src = [surv_src[i] for i in order]
 
-    # Duplicates: identical (collapse, report) vs conflicting (reject all, report).
+    # duplicates: identical requires OHLCV AND extras equal; else conflicting
     identical_collapsed = 0
     conflicting_groups = 0
     if surviving.index.has_duplicates:
-        dup_times = surviving.index[surviving.index.duplicated(keep=False)].unique()
-        keep_mask = pd.Series(True, index=range(len(surviving)))
-        cols = ["open", "high", "low", "close", "volume"]
-        vals = surviving[cols].reset_index(drop=True)
+        combined = surviving.copy()
+        for col in surv_extras.columns:
+            combined[f"__x_{col}"] = surv_extras[col].to_numpy()
         idx_arr = surviving.index
+        dup_times = idx_arr[idx_arr.duplicated(keep=False)].unique()
         drop_positions: list[int] = []
+        vals = combined.reset_index(drop=True)
         for t in dup_times:
             positions = [i for i, tt in enumerate(idx_arr) if tt == t]
             block = vals.iloc[positions]
             if block.drop_duplicates().shape[0] == 1:
-                # identical duplicates -> keep first, drop the rest
                 identical_collapsed += len(positions) - 1
                 drop_positions.extend(positions[1:])
             else:
-                # conflicting -> ambiguous, reject the whole group
                 conflicting_groups += 1
                 counts["conflicting_duplicate"] = counts.get("conflicting_duplicate", 0) + len(positions)
                 for i in positions:
-                    if len(samples) < _MAX_SAMPLES * 4:
-                        samples.append({"time": str(t), "reason": "conflicting_duplicate"})
+                    samples.append({"source_row": surv_src[i], "time": str(t),
+                                    "reason": "conflicting_duplicate"})
                 drop_positions.extend(positions)
         if drop_positions:
             keep = [i for i in range(len(surviving)) if i not in set(drop_positions)]
             surviving = surviving.iloc[keep]
+            surv_extras = surv_extras.iloc[keep]
+            surv_src = [surv_src[i] for i in keep]
         if identical_collapsed:
             warnings.append(f"{identical_collapsed} identical duplicate bar(s) collapsed to one each")
+        if conflicting_groups:
+            warnings.append(f"{conflicting_groups} conflicting duplicate timestamp group(s) rejected "
+                            "(same time, different OHLCV or extras)")
 
-    # Gaps (weekend/market-closed classified separately, not treated as errors).
+    # gaps (conservative classification; missing bars always visible)
     gap_count = 0
-    unexpected = 0
+    unresolved = 0
     largest: list[dict[str, Any]] = []
     if len(surviving) >= 2:
-        step = MINUTES[tf]
-        # A gap is classified, never treated as an error:
-        #   weekend_or_closed : the gap spans a Saturday/Sunday (market closed)
-        #   session_break     : a small intraday gap (<= 4 bars or <= 180 min),
-        #                       typically a daily broker rollover / session close
-        #   unexpected        : a larger non-weekend gap that may be missing data
-        # Only 'unexpected' is counted as something to worry about.
-        minor_threshold = max(180.0, 4 * step)
+        weekend_bar_cap = int(round(2.75 * 1440 / step))  # a plain weekend closure, generously
         deltas = surviving.index.to_series().diff().dropna().dt.total_seconds() / 60.0
-        gap_mask = deltas > 1.5 * step
-        gap_count = int(gap_mask.sum())
-        gap_points = deltas[gap_mask]
+        gap_points = deltas[deltas > 1.5 * step]
+        gap_count = int(len(gap_points))
         for end_time, minutes in gap_points.items():
             pos = surviving.index.get_loc(end_time)
             start_time = surviving.index[pos - 1]
-            if _is_weekend_gap(start_time, end_time):
+            missing_bars = int(round(minutes / step)) - 1
+            weekend = _is_weekend_gap(start_time, end_time)
+            if session_break_minutes and round(minutes) in session_break_minutes and not weekend:
+                category = "session_break_configured"
+            elif weekend and missing_bars <= weekend_bar_cap:
                 category = "weekend_or_closed"
-            elif minutes <= minor_threshold:
-                category = "session_break"
             else:
-                category = "unexpected"
-                unexpected += 1
-            largest.append({
-                "from": str(start_time), "to": str(end_time),
-                "minutes": round(float(minutes), 1),
-                "missing_bars": int(round(minutes / step)) - 1,
-                "category": category,
-            })
+                category = "unresolved"
+                unresolved += 1
+            largest.append({"from": str(start_time), "to": str(end_time),
+                            "minutes": round(float(minutes), 1),
+                            "missing_bars": missing_bars, "category": category})
         largest.sort(key=lambda g: g["minutes"], reverse=True)
         largest = largest[:10]
-        if unexpected:
-            warnings.append(f"{unexpected} unexpected (non-weekend, non-session-break) "
-                            "time gap(s) detected — review for missing data")
+        if unresolved:
+            missing_total = sum(g["missing_bars"] for g in largest if g["category"] == "unresolved")
+            warnings.append(
+                f"{unresolved} UNRESOLVED gap(s) (not a plain weekend; cannot be proven a "
+                "session break without a configured session calendar) — review for missing "
+                f"data; possible missing bars in the largest listed: {missing_total}")
 
-    # Staleness vs explicit reference time.
-    staleness: dict[str, Any] = {"status": "unknown"}
+    # staleness: measured from the last CLOSED bar's CLOSE time
+    staleness: dict[str, Any] = {"status": "unknown", "measured_from": "bar_close", "unit": "minutes"}
     last_bar = str(surviving.index[-1]) if len(surviving) else None
     first_bar = str(surviving.index[0]) if len(surviving) else None
     if ref is not None and len(surviving):
-        age = ref - surviving.index[-1]
-        age_min = age.total_seconds() / 60.0
+        last_cmp = comparison_index(surviving.index[[-1]], data_tz, tz_known)[0]
+        last_close = last_cmp + tf_delta
+        age_min = (ref - last_close).total_seconds() / 60.0
         tol_min = stale_tolerance.total_seconds() / 60.0 if stale_tolerance else None
-        staleness = {
-            "status": "evaluated",
-            "reference_time": str(ref),
-            "last_bar": last_bar,
-            "age_minutes": round(age_min, 2),
+        staleness.update({
+            "status": "evaluated" if tz_known else "provisional",
+            "reference_time": str(ref), "last_closed_bar_open": str(surviving.index[-1]),
+            "last_closed_bar_close": str(last_close), "age_minutes": round(age_min, 2),
             "tolerance_minutes": tol_min,
             "is_stale": (age_min > tol_min) if tol_min is not None else None,
-            "tz_known": imported.tz_known,
-        }
+            "tz_known": tz_known,
+        })
         if tol_min is not None and age_min > tol_min:
-            warnings.append(f"data is STALE: last bar {last_bar} is {age_min:.0f} min "
-                            f"before reference {ref} (tolerance {tol_min:.0f} min)")
+            warnings.append(f"data is STALE: last closed bar closes {last_close} is "
+                            f"{age_min:.0f} min before reference {ref} (tolerance {tol_min:.0f} min)"
+                            + ("" if tz_known else " [PROVISIONAL: timezone unknown]"))
 
+    surviving.index.name = "time"
     return QualityReport(
-        symbol=imported.symbol.canonical,
-        timeframe=tf.value,
-        total_rows=int(len(df)),
-        accepted_rows=int(len(surviving)),
-        rejected_counts=counts,
-        rejected_samples=samples[:_MAX_SAMPLES * 4],
-        warnings=warnings,
-        identical_duplicates_collapsed=identical_collapsed,
-        conflicting_duplicate_groups=conflicting_groups,
-        was_out_of_order=was_out_of_order,
-        gap_count=gap_count,
-        unexpected_gap_count=unexpected,
-        largest_gaps=largest,
-        staleness=staleness,
-        first_bar=first_bar,
-        last_bar=last_bar,
-        accepted_frame=surviving,
+        symbol=imported.symbol.canonical, timeframe=tf.value,
+        total_rows=int(n), accepted_rows=int(len(surviving)),
+        rejected_counts=counts, rejected_samples=samples[:_MAX_SAMPLES * 4],
+        warnings=warnings, identical_duplicates_collapsed=identical_collapsed,
+        conflicting_duplicate_groups=conflicting_groups, was_out_of_order=was_out_of_order,
+        gap_count=gap_count, unresolved_gap_count=unresolved, largest_gaps=largest,
+        staleness=staleness, forming_bar=forming_bar, forming_excluded_count=forming_excluded,
+        first_bar=first_bar, last_bar=last_bar,
+        accepted_frame=surviving, accepted_extras=surv_extras,
     )
 
 
 def _is_weekend_gap(start: pd.Timestamp, end: pd.Timestamp) -> bool:
-    """Heuristic: does the gap span a weekend / likely market close?
+    """True if the gap spans a Saturday/Sunday (likely weekend market close).
 
-    True if any calendar day strictly between the two bars (inclusive of the
-    start/end days) is a Saturday or Sunday, or the gap runs Friday->Monday.
-    Does not claim holidays; those simply show as non-weekend gaps for review.
+    A weekend span does NOT by itself make a long gap 'weekend-only': the caller
+    still compares the number of missing bars against a plain-weekend cap, so a
+    gap that also drops extra trading days is classed UNRESOLVED, not hidden.
     """
     if pd.isna(start) or pd.isna(end):
         return False
     day = start.normalize()
     last = end.normalize()
     while day <= last:
-        if day.weekday() >= 5:  # Sat/Sun
+        if day.weekday() >= 5:
             return True
         day += pd.Timedelta(days=1)
     return False

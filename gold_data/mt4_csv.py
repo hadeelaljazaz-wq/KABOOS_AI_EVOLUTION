@@ -44,6 +44,7 @@ import pandas as pd
 
 from .symbols import NormalizedSymbol, normalize_symbol
 from .timeframe import TimeframeResolution, resolve_timeframe
+from .timeutil import validate_timezone
 
 OHLC = ("open", "high", "low", "close")
 
@@ -57,9 +58,21 @@ _DT_FORMATS = (
     "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
 )
 
-_HEADER_TOKENS = {"date", "time", "open", "high", "low", "close", "volume", "vol",
-                  "tickvol", "<date>", "<time>", "<open>", "<high>", "<low>",
-                  "<close>", "<tickvol>", "<vol>", "<spread>"}
+# Recognised header names -> canonical role. A header cell is normalised by
+# lowercasing and stripping <> and surrounding whitespace before lookup.
+_COL_ALIASES = {
+    "date": "date", "time": "time",
+    "datetime": "datetime", "date time": "datetime", "timestamp": "datetime",
+    "open": "open", "o": "open",
+    "high": "high", "h": "high",
+    "low": "low", "l": "low",
+    "close": "close", "c": "close",
+    "tickvol": "volume", "tick_volume": "volume", "tickvolume": "volume",
+    "volume": "volume", "vol": "volume",
+    "spread": "spread", "real_volume": "real_volume", "realvolume": "real_volume",
+}
+_REQUIRED_ROLES = ("open", "high", "low", "close")
+_HEADER_TOKEN_SET = set(_COL_ALIASES)
 
 
 class UnsupportedFormatError(ValueError):
@@ -83,6 +96,9 @@ class ImportedSeries:
     header_tokens: list[str]
     imported_at: str
     raw_row_count: int
+    source_id: str = "unknown"          # declared broker/feed/server id; never inferred from the symbol
+    source_rows: list[int] = field(default_factory=list)  # source line number per parsed row (for audit)
+    original_columns: list[str] = field(default_factory=list)  # original header names, if any
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -90,18 +106,22 @@ class ImportedSeries:
         return self.symbol.canonical
 
     def source_fingerprint(self) -> dict[str, object]:
-        """Everything needed to identify this import's origin (no price data)."""
+        """Everything needed to identify this import's origin (no local path)."""
         return {
             "source_name": self.source_name,
+            "source_id": self.source_id,
             "file_sha256": self.file_sha256,
             "symbol_original": self.symbol.original,
             "symbol_canonical": self.symbol.canonical,
             "instrument_kind": self.symbol.kind.value,
             "timeframe": self.timeframe.timeframe.value,
             "timeframe_source": self.timeframe.source,
+            "timeframe_consistent": self.timeframe.consistent,
             "encoding": self.encoding,
             "delimiter": "tab" if self.delimiter == "\t" else self.delimiter,
             "had_header": self.had_header,
+            "original_columns": self.original_columns,
+            "extra_columns": list(self.extras.columns),
             "timezone": self.timezone or "UNKNOWN",
             "tz_known": self.tz_known,
             "imported_at": self.imported_at,
@@ -141,16 +161,59 @@ def _detect_delimiter(lines: list[str]) -> str:
     return best
 
 
-def _looks_like_header(fields: list[str]) -> bool:
-    joined = [f.strip().lower() for f in fields]
-    if any(tok in _HEADER_TOKENS for tok in joined):
-        return True
-    # a data row starts with a date/datetime; a header does not
-    return not (_DATE_RE.match(fields[0].strip()) or _DATETIME_RE.match(fields[0].strip()))
+def _norm_header_cell(cell: str) -> str:
+    return cell.strip().strip("<>").strip().lower()
+
+
+def _is_header_row(fields: list[str]) -> bool:
+    """A row is a header only if enough cells are RECOGNISED column names.
+
+    This deliberately does NOT treat "first field is not a date" as a header:
+    a corrupt first data row must be rejected, not silently swallowed as a
+    header (spec review item 4).
+    """
+    recognised = sum(1 for f in fields if _norm_header_cell(f) in _HEADER_TOKEN_SET)
+    return recognised >= 3
+
+
+def _map_header(fields: list[str]) -> dict[str, int]:
+    """Map a header row to {role: column_index}, rejecting duplicates/missing.
+
+    Supports columns in any order via their names. A duplicate recognised role
+    or a missing required price column raises UnsupportedFormatError.
+    """
+    roles: dict[str, int] = {}
+    extras_seen: list[str] = []
+    for i, cell in enumerate(fields):
+        role = _COL_ALIASES.get(_norm_header_cell(cell))
+        if role is None:
+            continue
+        # 'volume' may be claimed by tickvol AND volume/vol; keep the first,
+        # treat the later one as an extra rather than a hard duplicate error.
+        if role in roles:
+            if role == "volume":
+                extras_seen.append(cell)
+                continue
+            raise UnsupportedFormatError(
+                f"duplicate column for '{role}' in header {fields!r}"
+            )
+        roles[role] = i
+    missing = [r for r in _REQUIRED_ROLES if r not in roles]
+    if missing:
+        raise UnsupportedFormatError(
+            f"header {fields!r} is missing required column(s): {missing}. "
+            "Supported names: date/time (or a combined datetime), open, high, low, "
+            "close, and optionally volume."
+        )
+    if "datetime" not in roles and "date" not in roles:
+        raise UnsupportedFormatError(
+            f"header {fields!r} has no date/datetime column"
+        )
+    return roles
 
 
 def _layout(fields: list[str]) -> tuple[str, int]:
-    """Return (datetime_mode, price_start_index) for a DATA row, or raise."""
+    """Return (datetime_mode, price_start_index) for a HEADERLESS data row, or raise."""
     f0 = fields[0].strip()
     if _DATETIME_RE.match(f0):
         return "combined", 1
@@ -160,8 +223,10 @@ def _layout(fields: list[str]) -> tuple[str, int]:
         return "date_only", 1
     raise UnsupportedFormatError(
         "first field is not a recognised date/datetime: "
-        f"{f0!r}. Supported: 'YYYY.MM.DD', 'YYYY.MM.DD HH:MM[:SS]', or "
-        "a 'Date','Time' pair."
+        f"{f0!r}. With no header, only these shapes are supported: "
+        "'YYYY.MM.DD', 'YYYY.MM.DD HH:MM[:SS]', or a 'Date','Time' pair. "
+        "(If this row was meant to be a header, its column names were not "
+        "recognised.)"
     )
 
 
@@ -186,80 +251,120 @@ def read_mt4_csv(
     symbol: Optional[str] = None,
     timeframe: Optional[str] = None,
     timezone: Optional[str] = None,
+    source_id: Optional[str] = None,
 ) -> ImportedSeries:
     """Read one MT4/MT5 CSV export into an :class:`ImportedSeries`.
 
     ``symbol`` defaults to the stem of the filename (broker symbol kept, then
     normalised). ``timeframe`` may be given explicitly; otherwise it is
     resolved from a filename hint and/or the data's own spacing and verified.
-    ``timezone`` is recorded as-is; omit it to mark the timezone UNKNOWN.
+    ``timezone`` is VALIDATED (a bogus name raises) and recorded; omit it to
+    mark the timezone UNKNOWN. ``source_id`` is a declared broker/feed/server
+    identity; it is never inferred from the symbol suffix and defaults to
+    'unknown'.
     """
+    timezone = validate_timezone(timezone)  # bogus tz -> raises, never tz_known
     p = Path(path)
     raw = p.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
     encoding = _detect_encoding(raw)
     text = raw.decode(encoding, errors="replace").replace("\r\n", "\n").replace("\r", "\n")
     text = text.lstrip("﻿")
-    lines = [ln for ln in text.split("\n")]
-    nonempty = [ln for ln in lines if ln.strip()]
-    if not nonempty:
+    all_lines = text.split("\n")
+    # keep source line numbers (1-based) for audit; skip blank lines
+    numbered = [(i + 1, ln) for i, ln in enumerate(all_lines) if ln.strip()]
+    if not numbered:
         raise UnsupportedFormatError(f"file {p.name} is empty")
 
+    nonempty = [ln for _, ln in numbered]
     delim = _detect_delimiter(nonempty)
     first_fields = nonempty[0].split(delim)
-    had_header = _looks_like_header(first_fields)
-    header_tokens = [f.strip() for f in first_fields] if had_header else []
-    data_lines = nonempty[1:] if had_header else nonempty
-    if not data_lines:
+    notes: list[str] = []
+
+    header_map: Optional[dict[str, int]] = None
+    had_header = _is_header_row(first_fields)
+    header_tokens: list[str] = []
+    if had_header:
+        header_tokens = [f.strip() for f in first_fields]
+        header_map = _map_header(first_fields)   # raises on duplicate/missing
+        data_numbered = numbered[1:]
+    else:
+        data_numbered = numbered
+    if not data_numbered:
         raise UnsupportedFormatError(f"file {p.name} has a header but no data rows")
 
-    dt_mode, price_start = _layout(data_lines[0].split(delim))
+    src_rows = [n for n, _ in data_numbered]
+    data_lines = [ln for _, ln in data_numbered]
 
-    # Heavy parse via pandas on the data portion only.
     buf = io.StringIO("\n".join(data_lines))
     df = pd.read_csv(buf, header=None, sep=delim, dtype=str,
-                     skip_blank_lines=True, engine="c")
-    df = df.dropna(how="all")
+                     skip_blank_lines=False, engine="c")
     ncols = df.shape[1]
-    if ncols < price_start + 4:
-        raise UnsupportedFormatError(
-            f"file {p.name}: found {ncols} columns but need a datetime plus at "
-            f"least 4 price columns (O/H/L/C). First data row: {data_lines[0]!r}. "
-            "Supported shapes: 'Date,Time,O,H,L,C,V' or 'datetime,O,H,L,C,V[,...]'."
-        )
 
-    if dt_mode == "split":
-        dt_str = df.iloc[:, 0].str.strip() + " " + df.iloc[:, 1].str.strip()
+    if header_map is not None:
+        # locate columns BY NAME (supports any column order, no positional swap)
+        def col(role):
+            return df.iloc[:, header_map[role]]
+        if "datetime" in header_map:
+            dt_str = col("datetime")
+        elif "time" in header_map:
+            dt_str = col("date").str.strip() + " " + col("time").str.strip()
+        else:
+            dt_str = col("date")
+        o = pd.to_numeric(col("open"), errors="coerce")
+        h = pd.to_numeric(col("high"), errors="coerce")
+        low = pd.to_numeric(col("low"), errors="coerce")
+        c = pd.to_numeric(col("close"), errors="coerce")
+        used = set(header_map.values())
+        if "volume" in header_map:
+            volume = pd.to_numeric(col("volume"), errors="coerce")
+            notes.append("volume column is broker tick volume (not exchange/contract volume)")
+        else:
+            volume = pd.Series([pd.NA] * len(df), index=df.index)
+            notes.append("no volume column present in source")
+        extra_idx = [i for i in range(ncols) if i not in used]
+        extra_names = [header_tokens[i] if i < len(header_tokens) and header_tokens[i]
+                       else f"extra_{i}" for i in extra_idx]
     else:
-        dt_str = df.iloc[:, 0]
+        dt_mode, price_start = _layout(data_lines[0].split(delim))
+        if ncols < price_start + 4:
+            raise UnsupportedFormatError(
+                f"file {p.name}: found {ncols} columns but need a datetime plus at "
+                f"least 4 price columns (O/H/L/C). First data row: {data_lines[0]!r}. "
+                "Supported shapes: 'Date,Time,O,H,L,C,V' or 'datetime,O,H,L,C,V[,...]'."
+            )
+        if dt_mode == "split":
+            dt_str = df.iloc[:, 0].str.strip() + " " + df.iloc[:, 1].str.strip()
+        else:
+            dt_str = df.iloc[:, 0]
+        o = pd.to_numeric(df.iloc[:, price_start + 0], errors="coerce")
+        h = pd.to_numeric(df.iloc[:, price_start + 1], errors="coerce")
+        low = pd.to_numeric(df.iloc[:, price_start + 2], errors="coerce")
+        c = pd.to_numeric(df.iloc[:, price_start + 3], errors="coerce")
+        vol_idx = price_start + 4
+        if vol_idx < ncols:
+            volume = pd.to_numeric(df.iloc[:, vol_idx], errors="coerce")
+            notes.append("volume column is broker tick volume (not exchange/contract volume)")
+            extra_idx = list(range(vol_idx + 1, ncols))
+        else:
+            volume = pd.Series([pd.NA] * len(df), index=df.index)
+            notes.append("no volume column present in source")
+            extra_idx = []
+        extra_names = [f"extra_{j}" for j in range(1, len(extra_idx) + 1)]
+
     times = _parse_datetimes(dt_str)
+    frame = pd.DataFrame({"open": o.to_numpy(), "high": h.to_numpy(),
+                          "low": low.to_numpy(), "close": c.to_numpy(),
+                          "volume": volume.to_numpy()})
+    frame.index = pd.DatetimeIndex(pd.to_datetime(times).to_numpy(), name="time")
 
-    o = pd.to_numeric(df.iloc[:, price_start + 0], errors="coerce")
-    h = pd.to_numeric(df.iloc[:, price_start + 1], errors="coerce")
-    low = pd.to_numeric(df.iloc[:, price_start + 2], errors="coerce")
-    c = pd.to_numeric(df.iloc[:, price_start + 3], errors="coerce")
-    vol_idx = price_start + 4
-    notes: list[str] = []
-    if vol_idx < ncols:
-        volume = pd.to_numeric(df.iloc[:, vol_idx], errors="coerce")
-        notes.append("volume column is broker tick volume (not exchange/contract volume)")
-    else:
-        volume = pd.Series([pd.NA] * len(df), index=df.index)
-        notes.append("no volume column present in source")
-
-    frame = pd.DataFrame({"open": o, "high": h, "low": low, "close": c, "volume": volume})
-    frame.index = pd.DatetimeIndex(times, name="time")
-
-    # Preserve any trailing columns verbatim; we do NOT guess their meaning.
-    extra_cols = list(range(vol_idx + 1, ncols))
-    if extra_cols:
-        extras = df.iloc[:, extra_cols].copy()
-        extras.columns = [f"extra_{i}" for i in range(1, len(extra_cols) + 1)]
+    if extra_idx:
+        extras = df.iloc[:, extra_idx].copy()
+        extras.columns = extra_names
         extras.index = frame.index
         notes.append(
-            f"{len(extra_cols)} trailing column(s) preserved as extra_* "
-            "(broker-specific; meaning not declared in file — possibly real "
-            "volume or spread)"
+            f"{len(extra_idx)} extra column(s) preserved {extra_names} "
+            "(broker-specific; meaning not declared — possibly real volume or spread)"
         )
     else:
         extras = pd.DataFrame(index=frame.index)
@@ -271,6 +376,9 @@ def read_mt4_csv(
     if timezone is None:
         notes.append("timezone UNKNOWN (MT4/MT5 server time not declared); "
                      "operations needing confirmed time sync must be blocked")
+    if source_id is None:
+        notes.append("source_id UNKNOWN (broker/feed/server not declared; "
+                     "not inferred from the symbol suffix)")
 
     return ImportedSeries(
         frame=frame,
@@ -288,6 +396,9 @@ def read_mt4_csv(
         header_tokens=header_tokens,
         imported_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
         raw_row_count=int(len(frame)),
+        source_id=source_id or "unknown",
+        source_rows=src_rows,
+        original_columns=header_tokens,
         notes=notes,
     )
 

@@ -20,11 +20,25 @@ Design rules honoured here:
 
 from __future__ import annotations
 
+import copy
 import datetime as _dt
+import math
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
+
+
+def _check_price(value: Any, what: str) -> float:
+    """Return value as float, or raise: must be a finite, positive, non-bool number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{what} must be a numeric price, got {value!r}")
+    fv = float(value)
+    if not math.isfinite(fv):
+        raise ValueError(f"{what} must be finite (not NaN/Infinity), got {value!r}")
+    if fv <= 0:
+        raise ValueError(f"{what} must be positive, got {fv}")
+    return fv
 
 
 def _now_iso() -> str:
@@ -33,6 +47,19 @@ def _now_iso() -> str:
 
 def _short_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _bad_nested(field_name: str, value: Any):
+    raise ValueError(f"{field_name} entries must be the proper contract object or a dict "
+                     f"to construct one, got {type(value).__name__}: {value!r}")
+
+
+def _validate_iso(value: Any, what: str) -> str:
+    try:
+        _dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{what} must be an ISO-8601 datetime, got {value!r}") from exc
+    return str(value)
 
 
 class Direction(str, Enum):
@@ -97,10 +124,7 @@ class PriceLevel:
     label: Optional[str] = None
 
     def __post_init__(self):
-        if not isinstance(self.value, (int, float)) or isinstance(self.value, bool):
-            raise ValueError(f"price level value must be numeric, got {self.value!r}")
-        if self.value <= 0:
-            raise ValueError(f"price level must be positive, got {self.value}")
+        self.value = _check_price(self.value, "price level value")
         if not self.source or not str(self.source).strip():
             raise ValueError("every price level must record a non-empty source")
 
@@ -117,9 +141,10 @@ class Zone:
     def __post_init__(self):
         if isinstance(self.kind, str):
             self.kind = ZoneKind(self.kind)
-        for name, val in (("low", self.low), ("high", self.high)):
-            if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0:
-                raise ValueError(f"zone {name} must be a positive number, got {val!r}")
+        self.low = _check_price(self.low, "zone low")
+        self.high = _check_price(self.high, "zone high")
+        if self.invalidation is not None:
+            self.invalidation = _check_price(self.invalidation, "zone invalidation")
         if self.low > self.high:
             raise ValueError(f"zone low ({self.low}) must be <= high ({self.high})")
         if not self.source or not str(self.source).strip():
@@ -155,6 +180,12 @@ class ExpertReport:
             self.market_state = MarketState(self.market_state)
         if self.recommendation is not None and isinstance(self.recommendation, str):
             self.recommendation = Recommendation(self.recommendation)
+        # coerce + type-check nested values through their validated constructors
+        self.zones = [z if isinstance(z, Zone) else Zone(**z) if isinstance(z, dict)
+                      else _bad_nested("zones", z) for z in self.zones]
+        self.levels = [lv if isinstance(lv, PriceLevel) else PriceLevel(**lv)
+                       if isinstance(lv, dict) else _bad_nested("levels", lv)
+                       for lv in self.levels]
         if not self.expert_id or not self.snapshot_id or not self.cycle_id:
             raise ValueError("expert_id, cycle_id and snapshot_id are required")
         if self.uncertainty is not None and not (0.0 <= float(self.uncertainty) <= 1.0):
@@ -175,17 +206,20 @@ class ExpertReport:
 
     def revise(self, **changes: Any) -> "ExpertReport":
         """Return a NEW report derived from this one (original untouched)."""
+        # DEEP copy of mutable/nested values so the revised report shares no
+        # object with the original (editing one never touches the other).
         base = {
             "expert_id": self.expert_id, "cycle_id": self.cycle_id,
             "snapshot_id": self.snapshot_id, "specialty": self.specialty,
             "method_version": self.method_version, "direction": self.direction,
-            "market_state": self.market_state, "timeframes_used": list(self.timeframes_used),
-            "evidence": list(self.evidence), "zones": list(self.zones),
-            "levels": list(self.levels), "recommendation": self.recommendation,
+            "market_state": self.market_state,
+            "timeframes_used": copy.deepcopy(self.timeframes_used),
+            "evidence": copy.deepcopy(self.evidence), "zones": copy.deepcopy(self.zones),
+            "levels": copy.deepcopy(self.levels), "recommendation": self.recommendation,
             "wait_reason": self.wait_reason, "trade_plan_id": self.trade_plan_id,
             "uncertainty": self.uncertainty,
         }
-        base.update(changes)
+        base.update(copy.deepcopy(changes))
         base["revision"] = self.revision + 1
         base["revises_report_id"] = self.report_id
         return ExpertReport(**base)
@@ -216,13 +250,46 @@ class TradePlan:
             self.direction = Direction(self.direction)
         if isinstance(self.status, str):
             self.status = PlanStatus(self.status)
+        # coerce + type-check nested price objects through validated constructors
+        if isinstance(self.entry, dict):
+            self.entry = Zone(**self.entry)
+        elif self.entry is not None and not isinstance(self.entry, Zone):
+            _bad_nested("entry", self.entry)
+        if isinstance(self.stop_loss, dict):
+            self.stop_loss = PriceLevel(**self.stop_loss)
+        elif self.stop_loss is not None and not isinstance(self.stop_loss, PriceLevel):
+            _bad_nested("stop_loss", self.stop_loss)
+        self.targets = [t if isinstance(t, PriceLevel) else PriceLevel(**t)
+                        if isinstance(t, dict) else _bad_nested("targets", t)
+                        for t in self.targets]
         if self.owner_kind not in ("expert", "office"):
             raise ValueError("owner_kind must be 'expert' or 'office'")
         if not self.owner or not self.cycle_id or not self.snapshot_id:
             raise ValueError("owner, cycle_id and snapshot_id are required")
         if self.version < 1:
             raise ValueError("version must be >= 1")
+        if self.expiry is not None:
+            self.expiry = _validate_iso(self.expiry, "expiry")
         self.validate()
+
+    def updated(self, **changes: Any) -> "TradePlan":
+        """Return a NEW, re-validated plan with ``changes`` applied (version+1).
+
+        Direct attribute mutation is NOT re-validated; go through this method so
+        a modified plan cannot be used as valid without passing the checks again.
+        """
+        fields = {
+            "owner": self.owner, "owner_kind": self.owner_kind, "cycle_id": self.cycle_id,
+            "snapshot_id": self.snapshot_id, "direction": self.direction,
+            "supporting_report_ids": copy.deepcopy(self.supporting_report_ids),
+            "entry": copy.deepcopy(self.entry), "activation_condition": self.activation_condition,
+            "stop_loss": copy.deepcopy(self.stop_loss), "targets": copy.deepcopy(self.targets),
+            "cancel_conditions": copy.deepcopy(self.cancel_conditions), "expiry": self.expiry,
+            "status": self.status, "plan_id": self.plan_id,
+        }
+        fields.update(copy.deepcopy(changes))
+        fields["version"] = self.version + 1
+        return TradePlan(**fields)
 
     @property
     def is_actionable(self) -> bool:

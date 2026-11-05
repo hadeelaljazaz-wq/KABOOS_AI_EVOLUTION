@@ -4,16 +4,19 @@
     python3 -m gold_data check  FILE [options]              # quality report for one file
     python3 -m gold_data show   SNAPSHOT_DIR                # print a saved snapshot
 
-Exit codes:
-    0  success
-    2  usage error (bad arguments)
-    3  import / unsupported-format error
-    4  quality or validity failure (e.g. all rows rejected, or asserted
-       requirements not met)
+Exit codes (documented, review item 10):
+    0  success (and, when acceptance conditions were asked for, they were met)
+    2  usage / bad argument (invalid timezone, timeframe, or reference time)
+    3  import / unsupported-format / load / integrity error
+    4  acceptance failure (all rows rejected, strict requirements not met, or,
+       in `check`, data is stale against a tolerance the user supplied)
 
-The CLI never calls the last close "the current price", never assumes a
-timezone, and never fetches GC=F (or anything else) to stand in for missing
-data.
+Descriptive vs strict: with no acceptance flags, a command DESCRIBES the data
+(exit 0 even if imperfect). The moment the user supplies an acceptance
+condition (`--require-*`, `--min-bars`, `--max-staleness`, or a
+`--stale-tolerance` in `check`), failing it returns a non-zero code. Saving a
+snapshot is clearly labelled and never presented as acceptance success. Known
+errors are reported as one-line messages, never an unhandled traceback.
 """
 
 from __future__ import annotations
@@ -25,9 +28,19 @@ from pathlib import Path
 from typing import Optional
 
 from .mt4_csv import UnsupportedFormatError, read_mt4_csv
-from .snapshot import ConsumerRequirements, MarketSnapshot, load_snapshot
+from .snapshot import (
+    ConsumerRequirements,
+    IntegrityError,
+    MarketSnapshot,
+    load_snapshot,
+)
+from .timeutil import TimezoneError
 
 EXIT_OK, EXIT_USAGE, EXIT_IMPORT, EXIT_QUALITY = 0, 2, 3, 4
+
+
+class _Usage(Exception):
+    pass
 
 
 def _fmt_tf(d) -> str:
@@ -37,35 +50,34 @@ def _fmt_tf(d) -> str:
     cl = d.closed_last_bar
     closed = f"{cl.get('is_closed')} ({cl.get('status')})"
     stale = q.get("staleness", {})
-    stale_s = stale.get("is_stale")
+    consistent = "OK" if d.timeframe_consistent else "CONFLICTS DATA"
+    forming = f"  forming-bar-excluded={q.get('forming_excluded_count', 0)}"
     return (
-        f"  {d.timeframe:<4} bars={d.bar_count:<7} "
+        f"  {d.timeframe:<4} bars={d.bar_count:<7} tf={consistent}  "
         f"span={d.first_bar} .. {d.last_bar}\n"
-        f"       last-bar closed={closed}  rejected=[{rej_s}]  "
-        f"gaps={q.get('gap_count')} (non-weekend={q.get('unexpected_gap_count')})  "
-        f"stale={stale_s}"
+        f"       last-closed={closed}  rejected=[{rej_s}]  "
+        f"gaps={q.get('gap_count')} (unresolved={q.get('unresolved_gap_count')})  "
+        f"stale={stale.get('is_stale')} ({stale.get('status')}){forming}"
     )
 
 
-def format_snapshot_summary(snap: MarketSnapshot,
-                            validity: Optional[object] = None) -> str:
-    lines = []
-    lines.append(f"Snapshot {snap.snapshot_id}  [{snap.schema_version}]")
+def format_snapshot_summary(snap: MarketSnapshot, validity=None) -> str:
+    lines = [f"Snapshot {snap.snapshot_id}  [{snap.schema_version}]"]
     lines.append(f"Instrument : {snap.symbol_canonical} ({snap.instrument_kind.value})  "
                  f"broker symbols: {', '.join(snap.symbol_originals)}")
     spot = snap.instrument_kind.value == "spot"
     lines.append(f"             {'OTC spot/CFD — NOT exchange futures (GC=F)' if spot else snap.instrument_kind.value}")
+    lines.append(f"Source id  : {', '.join(snap.source_ids)}")
     lines.append(f"Timezone   : {snap.timezone or 'UNKNOWN'} (known={snap.tz_known})")
     lines.append(f"Created    : {snap.created_at}")
     lines.append(f"Analysis ref time: {snap.analysis_reference_time or 'not set'}")
     lines.append(f"Available timeframes: {snap.available_timeframes}")
     lines.append(f"Missing timeframes  : {snap.missing_timeframes} (not fabricated)")
-    lines.append("Per-timeframe:")
+    lines.append("Per-timeframe (analysis-safe = closed bars only):")
     for tf in snap.available_timeframes:
         lines.append(_fmt_tf(snap.timeframes[tf]))
-    lines.append("NOTE: 'last bar' is the last RECORDED candle's open time; it is NOT "
-                 "'the current price'. Closed status depends on the reference time, "
-                 "timeframe and (unknown) timezone.")
+    lines.append("NOTE: 'last-closed' is the last CLOSED candle at the reference time; a "
+                 "still-forming bar is excluded from analysis data and is NOT 'the current price'.")
     if snap.warnings:
         lines.append("Warnings:")
         for w in snap.warnings[:40]:
@@ -83,102 +95,99 @@ def _parse_ref_time(s: Optional[str]) -> Optional[_dt.datetime]:
     try:
         return _dt.datetime.fromisoformat(s)
     except ValueError:
-        raise SystemExit(f"[usage] --ref-time must be ISO format (e.g. 2026-11-05T05:00), got {s!r}")
+        raise _Usage(f"--ref-time must be ISO-8601 (e.g. 2026-11-05T05:00 or "
+                     f"2026-11-05T05:00+00:00), got {s!r}")
 
 
 def _requirements_from_args(args) -> Optional[ConsumerRequirements]:
     if not any([args.require_timeframes, args.min_bars, args.require_tz_known,
                 args.require_closed, args.max_staleness]):
         return None
-    return ConsumerRequirements(
-        required_timeframes=tuple(args.require_timeframes or ()),
-        min_bars_per_tf=args.min_bars or 0,
-        require_tz_known=bool(args.require_tz_known),
-        require_closed_last_bar=bool(args.require_closed),
-        max_staleness=_dt.timedelta(minutes=args.max_staleness) if args.max_staleness else None,
-    )
+    try:
+        return ConsumerRequirements(
+            required_timeframes=tuple(args.require_timeframes or ()),
+            min_bars_per_tf=args.min_bars or 0,
+            require_tz_known=bool(args.require_tz_known),
+            require_closed_last_bar=bool(args.require_closed),
+            max_staleness=_dt.timedelta(minutes=args.max_staleness) if args.max_staleness else None,
+        )
+    except ValueError as exc:
+        raise _Usage(f"invalid requirements: {exc}")
 
 
 def _cmd_import(args) -> int:
     files = [Path(f) for f in args.files]
     if args.timeframe and len(files) > 1:
-        print("[usage] --timeframe can only be used with a single file; "
-              "with several files the timeframe is resolved per file.", file=sys.stderr)
-        return EXIT_USAGE
+        raise _Usage("--timeframe can only be used with a single file; with several "
+                     "files the timeframe is resolved per file")
     ref = _parse_ref_time(args.ref_time)
-    try:
-        imports = [read_mt4_csv(f, symbol=args.symbol, timeframe=args.timeframe,
-                                timezone=args.timezone) for f in files]
-    except (UnsupportedFormatError, FileNotFoundError, OSError) as exc:
-        print(f"[import error] {exc}", file=sys.stderr)
-        return EXIT_IMPORT
-
-    try:
-        snap = MarketSnapshot.build(
-            imports, analysis_reference_time=ref,
-            stale_tolerance=_dt.timedelta(minutes=args.stale_tolerance) if args.stale_tolerance else None,
-        )
-    except ValueError as exc:
-        print(f"[build error] {exc}", file=sys.stderr)
-        return EXIT_QUALITY
+    imports = [read_mt4_csv(f, symbol=args.symbol, timeframe=args.timeframe,
+                            timezone=args.timezone, source_id=args.source_id) for f in files]
+    snap = MarketSnapshot.build(
+        imports, analysis_reference_time=ref,
+        stale_tolerance=_dt.timedelta(minutes=args.stale_tolerance) if args.stale_tolerance else None,
+        allow_mixed_sources=args.allow_mixed_sources)
 
     req = _requirements_from_args(args)
     validity = snap.validity(req) if req else None
     print(format_snapshot_summary(snap, validity))
 
-    if all(d.bar_count == 0 for d in snap.timeframes.values()):
-        print("[quality] every timeframe has zero accepted rows", file=sys.stderr)
-        return EXIT_QUALITY
+    empty = all(d.bar_count == 0 for d in snap.timeframes.values())
+    accepted = validity is None or validity.valid
 
     if args.out:
         out = snap.save(args.out)
-        print(f"\nSaved snapshot to: {out}")
+        label = "VALID & accepted" if (validity and validity.valid) else \
+                ("DESCRIPTIVE (no acceptance conditions asked)" if validity is None
+                 else "DESCRIPTIVE / NOT VALID for the asked requirements")
+        print(f"\nSaved snapshot to: {out}  [{label}]")
 
-    if validity is not None and not validity.valid:
-        print("\n[validity] snapshot does not meet the asserted requirements", file=sys.stderr)
+    if empty:
+        print("[accept] every timeframe has zero accepted rows", file=sys.stderr)
+        return EXIT_QUALITY
+    if not accepted:
+        print("\n[accept] snapshot does not meet the asserted requirements", file=sys.stderr)
         return EXIT_QUALITY
     return EXIT_OK
 
 
 def _cmd_check(args) -> int:
     ref = _parse_ref_time(args.ref_time)
-    try:
-        imp = read_mt4_csv(Path(args.file), symbol=args.symbol,
-                           timeframe=args.timeframe, timezone=args.timezone)
-    except (UnsupportedFormatError, FileNotFoundError, OSError) as exc:
-        print(f"[import error] {exc}", file=sys.stderr)
-        return EXIT_IMPORT
+    imp = read_mt4_csv(Path(args.file), symbol=args.symbol, timeframe=args.timeframe,
+                       timezone=args.timezone, source_id=args.source_id)
     from .quality import run_quality_checks
-    rep = run_quality_checks(
-        imp, reference_time=ref,
-        stale_tolerance=_dt.timedelta(minutes=args.stale_tolerance) if args.stale_tolerance else None,
-        cutoff_time=ref,
-    )
+    tol = _dt.timedelta(minutes=args.stale_tolerance) if args.stale_tolerance else None
+    rep = run_quality_checks(imp, reference_time=ref, stale_tolerance=tol, cutoff_time=ref)
     print(f"File     : {imp.source_name}")
     print(f"Symbol   : {imp.symbol.canonical} ({imp.symbol.kind.value})  original={imp.symbol.original}")
+    print(f"Source id: {imp.source_id}")
     print(f"Timeframe: {imp.timeframe.timeframe.value} (source={imp.timeframe.source}, "
           f"consistent={imp.timeframe.consistent})")
-    print(f"Rows     : total={rep.total_rows} accepted={rep.accepted_rows} rejected={rep.rejected_total}")
+    print(f"Rows     : total={rep.total_rows} accepted={rep.accepted_rows} rejected={rep.rejected_total} "
+          f"forming-excluded={rep.forming_excluded_count}")
     print(f"Rejected by reason: {rep.rejected_counts or 'none'}")
     print(f"Duplicates: identical_collapsed={rep.identical_duplicates_collapsed} "
           f"conflicting_groups={rep.conflicting_duplicate_groups}")
     print(f"Out-of-order input: {rep.was_out_of_order}")
-    print(f"Gaps     : total={rep.gap_count} non-weekend={rep.unexpected_gap_count}")
+    print(f"Gaps     : total={rep.gap_count} unresolved={rep.unresolved_gap_count}")
     print(f"Span     : {rep.first_bar} .. {rep.last_bar}")
     print(f"Staleness: {rep.staleness}")
     if rep.warnings:
         print("Warnings:")
         for w in rep.warnings[:40]:
             print(f"  - {w}")
-    return EXIT_OK if rep.accepted_rows > 0 else EXIT_QUALITY
+    # strict acceptance: a supplied tolerance makes freshness a requirement
+    if rep.accepted_rows == 0:
+        print("[accept] no accepted rows", file=sys.stderr)
+        return EXIT_QUALITY
+    if tol is not None and rep.staleness.get("is_stale") is True:
+        print("[accept] data is stale against the supplied --stale-tolerance", file=sys.stderr)
+        return EXIT_QUALITY
+    return EXIT_OK
 
 
 def _cmd_show(args) -> int:
-    try:
-        snap = load_snapshot(args.directory)
-    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
-        print(f"[load error] {exc}", file=sys.stderr)
-        return EXIT_IMPORT
+    snap = load_snapshot(args.directory)
     print(format_snapshot_summary(snap))
     return EXIT_OK
 
@@ -191,21 +200,22 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--symbol", help="override symbol (else taken from filename)")
         sp.add_argument("--timeframe", help="explicit timeframe (M1/M5/M15/M30/H1/H4/D1)")
         sp.add_argument("--timezone", help="IANA tz of the data; omit to mark UNKNOWN")
+        sp.add_argument("--source-id", help="declared broker/feed/server id (not inferred)")
         sp.add_argument("--ref-time", help="analysis reference time, ISO (e.g. 2026-11-05T05:00)")
         sp.add_argument("--stale-tolerance", type=float, metavar="MIN",
-                        help="staleness tolerance in minutes")
+                        help="staleness tolerance in minutes (in `check`, an acceptance condition)")
 
     pi = sub.add_parser("import", help="import file(s) -> MarketSnapshot")
     pi.add_argument("files", nargs="+")
     add_common(pi)
     pi.add_argument("--out", help="directory to save the snapshot into")
-    pi.add_argument("--require-timeframes", nargs="*", metavar="TF",
-                    help="assert these timeframes are present")
-    pi.add_argument("--min-bars", type=int, help="assert at least this many bars per TF")
+    pi.add_argument("--allow-mixed-sources", action="store_true",
+                    help="explicitly allow combining different source ids")
+    pi.add_argument("--require-timeframes", nargs="*", metavar="TF")
+    pi.add_argument("--min-bars", type=int)
     pi.add_argument("--require-tz-known", action="store_true")
     pi.add_argument("--require-closed", action="store_true")
-    pi.add_argument("--max-staleness", type=float, metavar="MIN",
-                    help="assert data is no older than this many minutes")
+    pi.add_argument("--max-staleness", type=float, metavar="MIN")
     pi.set_defaults(func=_cmd_import)
 
     pc = sub.add_parser("check", help="quality report for a single file")
@@ -222,7 +232,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except _Usage as exc:
+        print(f"[usage] {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except TimezoneError as exc:
+        print(f"[usage] timezone/reference error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except UnsupportedFormatError as exc:
+        print(f"[import error] {exc}", file=sys.stderr)
+        return EXIT_IMPORT
+    except IntegrityError as exc:
+        print(f"[integrity error] {exc}", file=sys.stderr)
+        return EXIT_IMPORT
+    except (FileNotFoundError, OSError) as exc:
+        print(f"[io error] {exc}", file=sys.stderr)
+        return EXIT_IMPORT
+    except ValueError as exc:
+        # build/validity/requirement problems (e.g. mixed instruments)
+        print(f"[error] {exc}", file=sys.stderr)
+        return EXIT_QUALITY
 
 
 if __name__ == "__main__":
