@@ -85,8 +85,15 @@ def coerce_reference(ref, data_tz: Optional[str], tz_known: bool) -> Optional[pd
     ts = pd.Timestamp(ref)
     if tz_known and data_tz:
         if ts.tz is None:
-            # documented policy: a naive reference is read in the DATA's timezone
-            ts = ts.tz_localize(data_tz, ambiguous="raise", nonexistent="raise")
+            # documented policy: a naive reference is read in the DATA's timezone;
+            # a nonexistent/ambiguous local reference is a hard, explicit error
+            # (we never silently pick one of the two possible instants).
+            try:
+                ts = ts.tz_localize(data_tz, ambiguous="raise", nonexistent="raise")
+            except Exception as exc:
+                raise TimezoneError(
+                    f"reference time {ref!r} does not exist or is ambiguous in "
+                    f"{data_tz} (DST transition): {exc}") from exc
         return ts.tz_convert("UTC")
     # data timezone unknown
     if ts.tz is not None:

@@ -262,6 +262,11 @@ class TradePlan:
         self.targets = [t if isinstance(t, PriceLevel) else PriceLevel(**t)
                         if isinstance(t, dict) else _bad_nested("targets", t)
                         for t in self.targets]
+        # Isolate nested price objects from any external reference the caller
+        # may still hold and mutate after construction (defensive copy).
+        self.entry = copy.deepcopy(self.entry)
+        self.stop_loss = copy.deepcopy(self.stop_loss)
+        self.targets = copy.deepcopy(self.targets)
         if self.owner_kind not in ("expert", "office"):
             raise ValueError("owner_kind must be 'expert' or 'office'")
         if not self.owner or not self.cycle_id or not self.snapshot_id:
@@ -293,7 +298,32 @@ class TradePlan:
 
     @property
     def is_actionable(self) -> bool:
+        """STATUS only — the plan is in a pending/active status.
+
+        This is NOT a validity claim. A plan can carry an actionable status and
+        still be invalid if a nested value was mutated after construction; use
+        ``is_usable``/``validate`` for the real check before acting on a plan.
+        """
         return self.status in _ACTIONABLE
+
+    @property
+    def is_usable(self) -> bool:
+        """True iff the plan is in an actionable status AND re-validates now."""
+        if self.status not in _ACTIONABLE:
+            return False
+        try:
+            self.validate()
+            return True
+        except ValueError:
+            return False
+
+    def _revalidate_nested(self) -> None:
+        """Re-run each nested price object's OWN invariants against its CURRENT
+        values, so a mutation after construction (e.g. stop_loss.value = -1) is
+        caught rather than trusted because the object once validated."""
+        for obj in [self.entry, self.stop_loss, *self.targets]:
+            if obj is not None:
+                obj.__post_init__()  # re-checks finite/positive/order/source now
 
     def _has_core_execution_fields(self) -> bool:
         return (self.direction in (Direction.LONG, Direction.SHORT)
@@ -302,6 +332,9 @@ class TradePlan:
                 and len(self.targets) >= 1)
 
     def validate(self) -> None:
+        # Re-check the CURRENT values of nested price objects first: a prior
+        # successful construction does not prove they are still valid.
+        self._revalidate_nested()
         # A pending plan is "awaiting activation" and MUST say on what; that is
         # what distinguishes it from a mere draft or from "wait, no plan".
         if self.status == PlanStatus.PENDING and not (

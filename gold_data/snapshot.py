@@ -50,14 +50,56 @@ def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+def _normalize_bars(frame: pd.DataFrame, extras: pd.DataFrame) -> pd.DataFrame:
+    """Fixed, round-trip-stable representation of one timeframe's bars.
+
+    - index: naive DatetimeIndex named 'time'
+    - open/high/low/close/volume: float64 (missing -> NaN)
+    - extra_* columns: kept as RAW TEXT (object strings) so an uninterpreted
+      value such as '007' keeps its leading zeros and 'NA' stays the text 'NA'
+      rather than being turned into a number or a missing value.
+
+    Applying this to an already-normalised frame is idempotent, so
+    build -> save -> load -> save reproduces identical bytes.
+    """
+    out = pd.DataFrame(index=pd.DatetimeIndex(frame.index))
+    out.index.name = "time"
+    for col in _OHLCV:
+        if col in frame.columns:
+            out[col] = pd.to_numeric(frame[col], errors="coerce").astype("float64")
+        else:
+            out[col] = pd.Series([float("nan")] * len(frame), index=out.index, dtype="float64")
+    for col in extras.columns:
+        out[col] = [("" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v))
+                    for v in extras[col].to_numpy()]
+    return out
+
+
 def _canonical_csv_bytes(frame: pd.DataFrame, extras: pd.DataFrame) -> bytes:
     """Deterministic byte serialisation of a timeframe's bars (OHLCV + extras)."""
-    out = frame[_OHLCV].copy()
-    for col in extras.columns:
-        out[col] = extras[col].to_numpy()
-    out.index = pd.DatetimeIndex(frame.index)
-    out.index.name = "time"
-    return out.to_csv().encode("utf-8")
+    return _normalize_bars(frame, extras).to_csv().encode("utf-8")
+
+
+def _parse_canonical(raw: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Inverse of the canonical serialisation: strings stay strings, prices float.
+
+    Returns (frame[OHLCV], extras) in the SAME normalised form, so recomputing
+    the content hash from the result reproduces the stored hash exactly.
+    """
+    import io
+    df = pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False, na_filter=False)
+    if "time" not in df.columns:
+        raise IntegrityError("bars file has no 'time' column")
+    index = pd.DatetimeIndex(pd.to_datetime(df["time"]) if len(df) else [], name="time")
+    frame = pd.DataFrame(index=index)
+    for col in _OHLCV:
+        if col in df.columns:
+            frame[col] = pd.to_numeric(df[col], errors="coerce").astype("float64").to_numpy()
+    extra_cols = [c for c in df.columns if c != "time" and c not in _OHLCV]
+    extras = pd.DataFrame(index=index)
+    for col in extra_cols:
+        extras[col] = df[col].to_numpy()  # raw text preserved
+    return frame, extras
 
 
 def _sha(data: bytes) -> str:
@@ -125,8 +167,8 @@ class ConsumerRequirements:
             if not isinstance(self.max_staleness, _dt.timedelta):
                 raise ValueError("max_staleness must be a timedelta")
             secs = self.max_staleness.total_seconds()
-            if secs <= 0 or not np.isfinite(secs):
-                raise ValueError("max_staleness must be a positive, finite duration")
+            if secs < 0 or not np.isfinite(secs):
+                raise ValueError("max_staleness must be a non-negative, finite duration")
 
 
 @dataclass
@@ -158,11 +200,17 @@ class MarketSnapshot:
     # -- identity / integrity -------------------------------------------
 
     def _id_basis(self) -> dict[str, Any]:
+        # Everything that defines WHICH data this snapshot is: instrument,
+        # declared source(s), timezone + whether it is known, the analysis
+        # reference time, and each timeframe's content + span + count. Changing
+        # any of these must change the id (review item 6).
         return {
             "schema": SCHEMA_VERSION,
             "symbol": self.symbol_canonical,
             "kind": self.instrument_kind.value,
+            "source_ids": sorted(self.source_ids),
             "tz": self.timezone or "UNKNOWN",
+            "tz_known": bool(self.tz_known),
             "ref": self.analysis_reference_time or "NONE",
             "timeframes": {
                 tf: {"first": d.first_bar, "last": d.last_bar, "bars": d.bar_count,
@@ -217,23 +265,37 @@ class MarketSnapshot:
         req = requirements
         reasons: list[str] = []
 
+        # (review item 1) integrity is a binding part of the usage gate: a
+        # snapshot whose in-memory content drifted from its fixed id is not
+        # valid, no matter what the requirements say.
+        try:
+            self.verify_integrity()
+        except IntegrityError as exc:
+            return ValidityResult(valid=False, reasons=[f"integrity: {exc}"],
+                                  requirements=asdict(req))
+
+        # (review item 4) a snapshot with no analysis-usable data anywhere is
+        # never valid — a known timezone is not evidence of valid empty data.
+        if not self.timeframes or all(d.bar_count == 0 for d in self.timeframes.values()):
+            reasons.append("no accepted rows in any timeframe (empty/descriptive snapshot)")
+
         checked = req.required_timeframes or tuple(self.timeframes)
         for tf in req.required_timeframes:
+            if tf not in self.timeframes:
+                reasons.append(f"required timeframe {tf} is missing")
+
+        # empty/conflict checks apply to EVERY timeframe the consumer will use
+        # (named explicitly, or all available when none are named).
+        for tf in checked:
             d = self.timeframes.get(tf)
             if d is None:
-                reasons.append(f"required timeframe {tf} is missing")
                 continue
             if d.bar_count == 0:
                 reasons.append(f"{tf} has no accepted rows (present but empty)")
             if not d.timeframe_consistent:
                 reasons.append(f"{tf} declared timeframe conflicts with the data "
                                "(proven inconsistency) — resolve before use")
-
-        for tf in checked:
-            d = self.timeframes.get(tf)
-            if d is None:
-                continue
-            if req.min_bars_per_tf and d.bar_count < req.min_bars_per_tf:
+            if req.min_bars_per_tf and 0 < d.bar_count < req.min_bars_per_tf:
                 reasons.append(f"{tf} has {d.bar_count} bars (< required {req.min_bars_per_tf}) "
                                "— cannot verify on this little data")
 
@@ -324,13 +386,18 @@ class MarketSnapshot:
             closed = _closed_status(last_cmp, tf, ref_closed, tz_known)
             if last_open is not None:
                 closed["last_bar_open"] = str(last_open)
-            content_sha = _sha(_canonical_csv_bytes(rep.accepted_frame, rep.accepted_extras))
+            # store the normalised, round-trip-stable representation so a built
+            # snapshot and a loaded one are byte-identical in content
+            norm = _normalize_bars(rep.accepted_frame, rep.accepted_extras)
+            norm_frame = norm[[c for c in _OHLCV if c in norm.columns]].copy()
+            norm_extras = norm[[c for c in norm.columns if c not in _OHLCV]].copy()
+            content_sha = _sha(norm.to_csv().encode("utf-8"))
             tfmap[tf.value] = TimeframeData(
                 timeframe=tf.value, timeframe_consistent=im.timeframe.consistent,
                 timeframe_source=im.timeframe.source, source=im.source_fingerprint(),
                 quality=rep.summary(), first_bar=rep.first_bar, last_bar=rep.last_bar,
                 bar_count=rep.accepted_rows, closed_last_bar=closed, content_sha256=content_sha,
-                forming_bar=rep.forming_bar, frame=rep.accepted_frame, extras=rep.accepted_extras)
+                forming_bar=rep.forming_bar, frame=norm_frame, extras=norm_extras)
             warnings.extend(f"[{tf.value}] {w}" for w in rep.warnings)
 
         return cls(symbol_canonical=symbol_canonical, instrument_kind=kind,
@@ -403,6 +470,11 @@ def load_snapshot(directory: str | Path) -> MarketSnapshot:
     if meta.get("schema_version") != SCHEMA_VERSION:
         raise IntegrityError(f"unsupported schema_version {meta.get('schema_version')!r}")
 
+    tz = meta["timezone"]
+    # cross-check tz_known vs timezone (review item 6): they must agree
+    if meta["tz_known"] != (tz != "UNKNOWN"):
+        raise IntegrityError(f"tz_known={meta['tz_known']} disagrees with timezone={tz!r}")
+
     tfmap: dict[str, TimeframeData] = {}
     for tf, m in meta["timeframes"].items():
         bars_file = m["bars_file"]
@@ -414,15 +486,31 @@ def load_snapshot(directory: str | Path) -> MarketSnapshot:
         raw = fp.read_bytes()
         if _sha(raw) != m["content_sha256"]:
             raise IntegrityError(f"content hash mismatch for {tf} ({bars_file} was modified)")
-        df = pd.read_csv(fp, index_col="time", parse_dates=["time"])
-        frame, extras = _split_ohlcv_extras(df)
+        # parse into the normalised form; strings stay strings, prices float
+        frame, extras = _parse_canonical(raw)
+        if _sha(_canonical_csv_bytes(frame, extras)) != m["content_sha256"]:
+            raise IntegrityError(f"{tf} serialisation drift on load (content not round-trip stable)")
         missing_cols = [c for c in ["open", "high", "low", "close"] if c not in frame.columns]
         if missing_cols:
             raise IntegrityError(f"{tf} bars missing columns {missing_cols}")
+        # RE-DERIVE identity-bearing facts from the actual content; never trust
+        # the metadata copies on their own (review item 6).
         if len(frame) != m["bar_count"]:
             raise IntegrityError(f"{tf} row count {len(frame)} != stored {m['bar_count']}")
-        if str(frame.index[-1]) != (m["last_bar"] or "None") and m["bar_count"]:
-            raise IntegrityError(f"{tf} last bar {frame.index[-1]} != stored {m['last_bar']}")
+        derived_first = str(frame.index[0]) if len(frame) else None
+        derived_last = str(frame.index[-1]) if len(frame) else None
+        if (m["first_bar"] or None) != derived_first:
+            raise IntegrityError(f"{tf} first bar {derived_first} != stored {m['first_bar']}")
+        if (m["last_bar"] or None) != derived_last:
+            raise IntegrityError(f"{tf} last bar {derived_last} != stored {m['last_bar']}")
+        # per-timeframe source must match the snapshot's instrument
+        src = m.get("source", {})
+        if src.get("symbol_canonical") not in (None, meta["symbol_canonical"]):
+            raise IntegrityError(f"{tf} source symbol {src.get('symbol_canonical')} != "
+                                 f"snapshot symbol {meta['symbol_canonical']}")
+        if src.get("instrument_kind") not in (None, meta["instrument_kind"]):
+            raise IntegrityError(f"{tf} source kind {src.get('instrument_kind')} != "
+                                 f"snapshot kind {meta['instrument_kind']}")
         tfmap[tf] = TimeframeData(
             timeframe=m["timeframe"], timeframe_consistent=m["timeframe_consistent"],
             timeframe_source=m["timeframe_source"], source=m["source"], quality=m["quality"],
@@ -430,7 +518,6 @@ def load_snapshot(directory: str | Path) -> MarketSnapshot:
             closed_last_bar=m["closed_last_bar"], content_sha256=m["content_sha256"],
             forming_bar=m.get("forming_bar"), frame=frame, extras=extras)
 
-    tz = meta["timezone"]
     snap = MarketSnapshot(
         symbol_canonical=meta["symbol_canonical"],
         instrument_kind=InstrumentKind(meta["instrument_kind"]),

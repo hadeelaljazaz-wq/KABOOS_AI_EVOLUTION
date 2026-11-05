@@ -297,8 +297,12 @@ def read_mt4_csv(
     data_lines = [ln for _, ln in data_numbered]
 
     buf = io.StringIO("\n".join(data_lines))
+    # keep_default_na=False so an uninterpreted text like 'NA' in an extra
+    # column is preserved verbatim rather than turned into a missing value;
+    # empty price cells still become NaN via to_numeric below.
     df = pd.read_csv(buf, header=None, sep=delim, dtype=str,
-                     skip_blank_lines=False, engine="c")
+                     skip_blank_lines=False, engine="c",
+                     keep_default_na=False, na_filter=False)
     ncols = df.shape[1]
 
     if header_map is not None:

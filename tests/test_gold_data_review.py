@@ -361,7 +361,9 @@ def test_item9_extras_preserved_through_save_load(tmp_path):
     d = snap.save(tmp_path / "snap")
     loaded = load_snapshot(d)
     ex = loaded.timeframes["H1"].extras
-    assert "extra_1" in ex.columns and list(ex["extra_1"]) == [7, 8, 9]
+    # extras are uninterpreted and kept as RAW TEXT (not coerced to numbers),
+    # so leading zeros / 'NA' survive a save/load round-trip (review round-2 item 5)
+    assert "extra_1" in ex.columns and list(ex["extra_1"]) == ["7", "8", "9"]
 
 
 def test_item9_extras_difference_makes_duplicate_conflicting(tmp_path):

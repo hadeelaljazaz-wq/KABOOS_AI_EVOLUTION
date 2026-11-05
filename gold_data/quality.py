@@ -116,6 +116,12 @@ def run_quality_checks(
 
     idx = frame.index
     cmp_idx = comparison_index(idx, data_tz, tz_known)
+    # When the timezone is known, a local timestamp that does not exist or is
+    # ambiguous at a DST transition becomes NaT on the UTC conversion. Such a
+    # row has a valid-looking naive time but cannot be placed on the real
+    # timeline, so it must be rejected (not silently accepted).
+    localize_failed = np.asarray(cmp_idx.isna()) & ~np.asarray(idx.isna()) if tz_known \
+        else np.zeros(len(frame), dtype=bool)
 
     o = pd.to_numeric(frame["open"], errors="coerce").to_numpy(dtype="float64")
     h = pd.to_numeric(frame["high"], errors="coerce").to_numpy(dtype="float64")
@@ -152,6 +158,7 @@ def run_quality_checks(
         rejected[m] = True
 
     mark(bad_time, "bad_timestamp")
+    mark(localize_failed, "dst_unlocalizable_local_time")
     mark(nonfinite, "nonfinite_or_missing_price")
     mark(nonpos, "nonpositive_price")
     mark(ohlc_bad, "ohlc_inconsistent")
@@ -163,7 +170,8 @@ def run_quality_checks(
 
     counts: dict[str, int] = {}
     samples: list[dict[str, Any]] = []
-    for label in ("bad_timestamp", "nonfinite_or_missing_price", "nonpositive_price",
+    for label in ("bad_timestamp", "dst_unlocalizable_local_time",
+                  "nonfinite_or_missing_price", "nonpositive_price",
                   "ohlc_inconsistent", "negative_volume", "after_reference_time"):
         positions = np.nonzero(reason == label)[0]
         if len(positions):

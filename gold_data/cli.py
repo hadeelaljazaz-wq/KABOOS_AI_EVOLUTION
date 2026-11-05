@@ -99,17 +99,34 @@ def _parse_ref_time(s: Optional[str]) -> Optional[_dt.datetime]:
                      f"2026-11-05T05:00+00:00), got {s!r}")
 
 
+def _tolerance_minutes(value: Optional[float], flag: str) -> Optional[float]:
+    """Validate a staleness tolerance in minutes. None = not supplied.
+
+    0 is accepted (zero slack); negative, NaN and Infinity are rejected. The
+    check is `is not None`, so a supplied 0 is never dropped by truthiness.
+    """
+    if value is None:
+        return None
+    import math
+    if not math.isfinite(value) or value < 0:
+        raise _Usage(f"{flag} must be a finite, non-negative number of minutes, got {value!r}")
+    return value
+
+
 def _requirements_from_args(args) -> Optional[ConsumerRequirements]:
-    if not any([args.require_timeframes, args.min_bars, args.require_tz_known,
-                args.require_closed, args.max_staleness]):
+    max_stale = _tolerance_minutes(args.max_staleness, "--max-staleness")
+    # `is not None` so an explicit 0 (min-bars or staleness) is honoured, not dropped
+    asked = (args.require_timeframes is not None or (args.min_bars is not None)
+             or args.require_tz_known or args.require_closed or max_stale is not None)
+    if not asked:
         return None
     try:
         return ConsumerRequirements(
             required_timeframes=tuple(args.require_timeframes or ()),
-            min_bars_per_tf=args.min_bars or 0,
+            min_bars_per_tf=args.min_bars if args.min_bars is not None else 0,
             require_tz_known=bool(args.require_tz_known),
             require_closed_last_bar=bool(args.require_closed),
-            max_staleness=_dt.timedelta(minutes=args.max_staleness) if args.max_staleness else None,
+            max_staleness=_dt.timedelta(minutes=max_stale) if max_stale is not None else None,
         )
     except ValueError as exc:
         raise _Usage(f"invalid requirements: {exc}")
@@ -156,7 +173,8 @@ def _cmd_check(args) -> int:
     imp = read_mt4_csv(Path(args.file), symbol=args.symbol, timeframe=args.timeframe,
                        timezone=args.timezone, source_id=args.source_id)
     from .quality import run_quality_checks
-    tol = _dt.timedelta(minutes=args.stale_tolerance) if args.stale_tolerance else None
+    tol_min = _tolerance_minutes(args.stale_tolerance, "--stale-tolerance")
+    tol = _dt.timedelta(minutes=tol_min) if tol_min is not None else None
     rep = run_quality_checks(imp, reference_time=ref, stale_tolerance=tol, cutoff_time=ref)
     print(f"File     : {imp.source_name}")
     print(f"Symbol   : {imp.symbol.canonical} ({imp.symbol.kind.value})  original={imp.symbol.original}")
@@ -176,13 +194,21 @@ def _cmd_check(args) -> int:
         print("Warnings:")
         for w in rep.warnings[:40]:
             print(f"  - {w}")
-    # strict acceptance: a supplied tolerance makes freshness a requirement
+    # strict acceptance: a supplied tolerance makes freshness a REQUIREMENT, and
+    # a requirement that cannot be proven is NOT met (review item 7).
     if rep.accepted_rows == 0:
         print("[accept] no accepted rows", file=sys.stderr)
         return EXIT_QUALITY
-    if tol is not None and rep.staleness.get("is_stale") is True:
-        print("[accept] data is stale against the supplied --stale-tolerance", file=sys.stderr)
-        return EXIT_QUALITY
+    if tol is not None:
+        st = rep.staleness
+        if st.get("status") != "evaluated":
+            print(f"[accept] freshness cannot be CONFIRMED (staleness status="
+                  f"{st.get('status')}: need a reference time and a known timezone)",
+                  file=sys.stderr)
+            return EXIT_QUALITY
+        if st.get("is_stale") is not False:
+            print("[accept] data is stale against the supplied --stale-tolerance", file=sys.stderr)
+            return EXIT_QUALITY
     return EXIT_OK
 
 
