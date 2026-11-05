@@ -23,13 +23,14 @@ once cannot corrupt state or half-apply a status transition.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_memory (
@@ -175,6 +176,28 @@ class CollectiveMemory:
         with self._lock:
             self._conn.close()
 
+    @contextlib.contextmanager
+    def _write_txn(self) -> Iterator[sqlite3.Connection]:
+        """A real, serialised write transaction.
+
+        The in-process ``RLock`` orders threads that share this connection.
+        ``BEGIN IMMEDIATE`` additionally takes SQLite's write lock up front, so
+        a *different* connection or process racing on the same file is held off
+        (riding out the wait via ``busy_timeout``) and then sees the committed
+        result. Read-modify-write transitions therefore stay atomic across
+        connections, not only within one process. On any error the partial work
+        is rolled back, so a half-applied status transition can never persist.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            else:
+                self._conn.execute("COMMIT")
+
     # ---- per-agent long-term memory ----------------------------------
 
     def remember(
@@ -227,15 +250,15 @@ class CollectiveMemory:
             raise ValueError(
                 f"unknown message_type {message_type!r}; valid: {sorted(MESSAGE_TYPES)}"
             )
-        with self._lock:
-            meta = self._conn.execute(
+        with self._write_txn() as conn:
+            meta = conn.execute(
                 "SELECT status FROM discussions WHERE id=?", (discussion_id,)
             ).fetchone()
             if meta is None:
                 raise ValueError(f"no discussion with id={discussion_id}")
             if meta["status"] == "closed":
                 raise ValueError(f"discussion id={discussion_id} is closed; reopen it to post")
-            cur = self._conn.execute(
+            cur = conn.execute(
                 "INSERT INTO discussion_messages (discussion_id, agent_id, message_type, message, created_at)"
                 " VALUES (?, ?, ?, ?, ?)",
                 (discussion_id, agent_id, message_type, message, _now()),
@@ -250,25 +273,25 @@ class CollectiveMemory:
             ).fetchall()
 
     def close_discussion(self, discussion_id: int) -> None:
-        with self._lock:
-            meta = self._conn.execute(
+        with self._write_txn() as conn:
+            meta = conn.execute(
                 "SELECT status FROM discussions WHERE id=?", (discussion_id,)
             ).fetchone()
             if meta is None:
                 raise ValueError(f"no discussion with id={discussion_id}")
-            self._conn.execute(
+            conn.execute(
                 "UPDATE discussions SET status='closed', closed_at=? WHERE id=?",
                 (_now(), discussion_id),
             )
 
     def reopen_discussion(self, discussion_id: int) -> None:
-        with self._lock:
-            meta = self._conn.execute(
+        with self._write_txn() as conn:
+            meta = conn.execute(
                 "SELECT status FROM discussions WHERE id=?", (discussion_id,)
             ).fetchone()
             if meta is None:
                 raise ValueError(f"no discussion with id={discussion_id}")
-            self._conn.execute(
+            conn.execute(
                 "UPDATE discussions SET status='open', closed_at=NULL WHERE id=?",
                 (discussion_id,),
             )
@@ -310,11 +333,12 @@ class CollectiveMemory:
 
         Requires well-formed backing evidence (see ``validate_evidence``) and
         a pending-hypothesis source state. Raises ValueError otherwise. The
-        read of current status and the write happen under one lock, so two
-        agents cannot both win a confirm/reject race on the same row.
+        read of current status and the write happen inside one
+        ``BEGIN IMMEDIATE`` transaction, so two agents cannot both win a
+        confirm/reject race on the same row even from separate connections.
         """
         validate_evidence(evidence)
-        with self._lock:
+        with self._write_txn():
             self._require_pending_hypothesis(knowledge_id)
             self._conn.execute(
                 "UPDATE knowledge SET status='confirmed', evidence=?, validated_by=?, updated_at=? WHERE id=?",
@@ -330,7 +354,7 @@ class CollectiveMemory:
         """
         if not reason or not reason.strip():
             raise ValueError("a non-empty reason is required to reject a hypothesis")
-        with self._lock:
+        with self._write_txn():
             self._require_pending_hypothesis(knowledge_id)
             self._conn.execute(
                 "UPDATE knowledge SET status='rejected', evidence=?, validated_by=?, updated_at=? WHERE id=?",

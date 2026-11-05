@@ -172,6 +172,65 @@ def test_bug5_concurrent_confirm_has_single_winner(tmp_path):
     assert len(losses) == 9
 
 
+def test_bug5_confirm_single_winner_across_separate_connections(tmp_path):
+    # Stronger than the shared-connection race: each thread opens its OWN
+    # CollectiveMemory (its own sqlite connection) on the same file, so the
+    # in-process RLock gives no protection. Only the BEGIN IMMEDIATE
+    # transaction + busy_timeout can keep this to a single winner. This is the
+    # multi-process concurrency guarantee the spec asks for.
+    db = tmp_path / "multiconn.db"
+    seed = CollectiveMemory(db)
+    hid = seed.propose_hypothesis("t", "s", "a")
+    seed.close()
+
+    wins, losses = [], []
+
+    def racer():
+        conn = CollectiveMemory(db)
+        try:
+            conn.confirm_hypothesis(
+                hid, evidence={"backtest_id": "bt", "sample_size": 10}, validated_by="x"
+            )
+            wins.append(1)
+        except ValueError:
+            losses.append(1)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=racer) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(wins) == 1
+    assert len(losses) == 9
+    # and the persisted state is exactly one confirmed row
+    check = CollectiveMemory(db)
+    items = check.query_knowledge(topic="t")
+    check.close()
+    assert len(items) == 1 and items[0].status == "confirmed"
+
+
+def test_write_txn_rolls_back_on_error(tmp_path):
+    # A failed transition must leave no partial state behind.
+    db = tmp_path / "rollback.db"
+    mem = CollectiveMemory(db)
+    hid = mem.propose_hypothesis("t", "s", "a")
+    # Rejecting with an empty reason raises BEFORE the transaction opens;
+    # a wrong-state transition raises INSIDE it and must roll back cleanly,
+    # leaving the row still a pending hypothesis and the connection usable.
+    mem.confirm_hypothesis(hid, evidence={"backtest_id": "x", "sample_size": 5}, validated_by="v")
+    with pytest.raises(ValueError):
+        mem.reject_hypothesis(hid, reason="too late", validated_by="v")
+    # connection still works after the rollback
+    hid2 = mem.propose_hypothesis("t2", "s2", "a")
+    mem.reject_hypothesis(hid2, reason="valid rejection", validated_by="v")
+    assert mem.query_knowledge(topic="t")[0].status == "confirmed"
+    assert mem.query_knowledge(topic="t2")[0].status == "rejected"
+    mem.close()
+
+
 def test_discussion_resumable_after_restart(tmp_path):
     db = tmp_path / "resume.db"
     m1 = CollectiveMemory(db)
